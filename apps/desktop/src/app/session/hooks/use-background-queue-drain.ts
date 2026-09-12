@@ -7,9 +7,11 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimConfirmedQueuedPrompt,
   MAX_AUTO_DRAIN_ATTEMPTS,
   noteQueuedPromptDrainFailure,
   type QueuedPromptEntry,
+  releaseConfirmedQueuedPrompt,
   removeQueuedPrompt,
   resolveQueuedPromptTransport,
   shouldAutoDrain,
@@ -189,18 +191,27 @@ export function useBackgroundQueueDrain({
 
         const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
 
+        if (liveEntry.confirmedExternal && !claimConfirmedQueuedPrompt(sessionKey, liveEntry.id)) {
+          return true
+        }
+
         const accepted = await Promise.resolve(
           submitTextRef.current(resolved.transportText, {
             attachments: liveEntry.attachments,
             ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
             fromQueue: true,
             submission_id: liveEntry.id,
+            ...(liveEntry.confirmedExternal ? { confirmedExternal: true } : {}),
             sessionId: runtimeSessionId,
             storedSessionId: sessionKey
           })
         )
 
         if (accepted !== true) {
+          if (liveEntry.confirmedExternal && accepted === false) {
+            releaseConfirmedQueuedPrompt(sessionKey, liveEntry.id)
+          }
+
           return false
         }
 
