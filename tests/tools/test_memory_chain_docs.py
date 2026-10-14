@@ -181,3 +181,15 @@ def test_linked_doc_is_not_reported_as_orphan(store):
 
     assert "orphan_docs" not in anchor
     assert anchor["chain_docs"][0]["name"] == DOC
+
+
+def test_chain_doc_patch_works_against_the_uncapped_limit(store):
+    """Chain docs are uncapped (limit None); patch must tolerate that like add does, rather
+    than comparing an int against None (#116564)."""
+    _call(store, action="add", target="memory", content=ANCHOR_REF)
+    _call(store, action="add", target="memory", doc=DOC, content="first note")
+
+    result = _call(store, action="patch", target="memory", doc=DOC, old_text="first", content="second")
+
+    assert result["success"] is True, result
+    assert _call(store, action="read", target="memory", doc=DOC)["entries"] == ["second note"]
