@@ -29,6 +29,12 @@ _POLL = 0.1
 # ``steer()`` / ``redirect()``'s reply when the owner consumed the text as a typed voice stop (TUI-26):
 # truthy, so a caller that only asks "taken?" never re-queues it.
 VOICE_STOPPED = "voice_stopped"
+# A turn the previous gateway life died running is fenced ``unknown``: never replayed, and the
+# session FIFO waits behind it until it is acknowledged, so a prompt queued there never runs.
+_LOST_TURN = ("A turn in this session was lost when the gateway restarted, so its outcome is unknown and "
+              "nothing queued after it can run; your message was not run. Run /discard to acknowledge "
+              "the lost turn (it is not replayed), then send your message again.")
+_BLOCKED = object()  # _pump: this turn's admission is queued behind a lost turn
 
 _RESULT_DEFAULTS = {
     "final_response": "", "failed": False, "partial": False, "error": None, "failure_reason": None,
@@ -771,11 +777,13 @@ class GatewayAgent:
             try:
                 # Inside the try: staging an image is a gateway call, and its failure is a failed turn.
                 # Building the params consumes a ``/model --once`` pick (``_take_turn_route``).
-                notice = self._prepare_submit(turn)
-                if notice:
-                    # Refused before prompt.submit: nothing was admitted, so the CLI keeps the turn's
-                    # local state (no history row, the /model --once pick and notes) for the resend.
-                    return {**self._failed(history, user_message, notice, failure_reason="gateway_connection"),
+                self._prepare_submit(turn)
+                if self._lost_turns():
+                    # A prompt queued behind a fenced turn never runs: refuse it with the recovery
+                    # instead, before anything is admitted (the CLI keeps the turn's local state).
+                    notice = self._lost_turn_notice()
+                    return {**self._failed(history, user_message, f"{_LOST_TURN}\n{notice}" if notice else _LOST_TURN,
+                                           failure_reason="unknown_execution"),
                             "messages": history, "admitted": False}
                 params = self._submit_params(user_message, persist_user_message, turn_author)
                 if self._stop(turn)():
@@ -808,6 +816,13 @@ class GatewayAgent:
         finally:
             if self._owns(turn):
                 self._generation_done()
+        if outcome is _BLOCKED:
+            # Fenced after the check above (a restart mid-submit): withdraw the queued prompt.
+            try:
+                self.connection.call("prompt.cancel", session_id=self.session_id, admission_id=self._admission)
+            except GatewayClientError as exc:
+                logger.debug("prompt.cancel behind a lost turn failed: %s", exc)
+            return self._failed(history, user_message, _LOST_TURN, failure_reason="unknown_execution")
         if isinstance(outcome, Exception) and self._owns(turn):
             return self._failed(history, user_message, str(outcome) or DISCONNECTED,
                                 failure_reason="gateway_connection")
@@ -855,28 +870,56 @@ class GatewayAgent:
         return lambda: not self._owns(turn)
 
     def _prepare_submit(self, turn):
-        """Before a prompt is sent: re-attach after a replay gap, give a redialled (restarted) owner the
-        reasoning flag again, and return the notice of a turn lost in that restart: a prompt queued
-        behind it would wait with no end, so it is refused until ``/discard``."""
+        """Before a prompt is sent: re-attach after a replay gap and give a redialled (restarted) owner
+        the reasoning flag again, so the state carries a turn that restart fenced."""
         state = self._state()
         if state.gaps != state.attached_gaps:  # a replay gap between turns retired the subscription
             self.connection.reattach(turn.session_id, abandon=self._stop(turn))
         self.connection.start()
         self._sync_show_reasoning()
-        return self._lost_turn_notice()
+
+    def _lost_turns(self):
+        """Admissions a gateway restart fenced ``unknown``: never replayed, and the FIFO waits behind them."""
+        return [row["admission_id"] for row in self._state().pending if row.get("status") == "unknown"]
 
     def _lost_turn_notice(self):
         from hermes_cli.gateway_chat_view import pending_lines
         pending = self._state().pending
         return "\n".join(pending_lines(pending)) if any(row["status"] == "unknown" for row in pending) else ""
 
+    def _queued_behind_lost(self):
+        """This turn's admission still waits in a FIFO a lost turn holds (``session.info`` pending)."""
+        own = next((row.get("status") for row in self._state().pending
+                    if row.get("admission_id") == self._admission), None)
+        return own == "queued" and bool(self._lost_turns())
+
+    def _running_ahead(self):
+        """The admission another viewer (an automation, a resumed earlier prompt) is running while
+        this turn's admission waits queued behind it; None when this turn is not waiting on one."""
+        pending = self._state().pending
+        own = next((row.get("status") for row in pending if row.get("admission_id") == self._admission), None)
+        if own != "queued":
+            return None
+        return next((row.get("admission_id") for row in pending
+                     if row.get("status") == "started" and row.get("admission_id") != self._admission), None)
+
     def _pump(self, stream_callback, starts, turn):
         """Dispatch frames until this admission's ``message.complete``; returns its payload, or the
         transport error (disconnect)."""
         events = self.connection.events
+        told_queued = False
         while self._owns(turn):
             if self._expired():
                 return {"status": "interrupted", "outcome": "cancelled", "_settle_timeout": True}
+            if self._queued_behind_lost():
+                return _BLOCKED
+            ahead = None if told_queued else self._running_ahead()
+            if ahead:
+                # Its frames belong to that admission and are not this turn's reply; say why this
+                # one is silent instead of leaving the user to resend into the same queue.
+                told_queued = True
+                self._emit_print(f"Queued: another turn is still running in this session ({ahead}); "
+                                 "your message runs when it finishes. Do not resend it.")
             try:
                 frame = events.get(timeout=_POLL)
             except queue.Empty:
