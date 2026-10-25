@@ -1084,6 +1084,7 @@ catalog: CatalogTranslations
       updateAllDone: string
       updateAllFailed: string
       updateSkippedCloud: string
+      updateSkippedExternal: (command: string) => string
       kindLocal: string
       kindRemote: string
       kindCloud: string
