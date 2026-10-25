@@ -130,6 +130,11 @@ _REPETITION_STREAM_CUT = repetition_copy(
     "so the stream was stopped instead of running on. The partial response was discarded.",
     " and the stream was cut mid-loop; discarding the",
 )
+_PLUGIN_STREAM_CUT = (
+    "Stream cut at the request of a plugin",
+    "The stream was stopped because a plugin asked the core to. The partial response was discarded.",
+    "plugin_stream_interrupt",
+)
 _CEILING_NO_TEXT = (
     "⚠️ **No visible answer was produced.** The model hit its output-token limit on every "
     "continuation attempt — its reasoning consumed the entire budget each time.\n\nTo fix this:\n"
@@ -471,6 +476,13 @@ def recover_from_truncation(
         truncated_tool_call_retries=truncated_tool_call_retries, retry_count=retry_count,
         compression_attempts=compression_attempts,
     )
+    plugin_cut = getattr(response, "_plugin_interrupt_reason", "")
+    if plugin_cut:
+        # A plugin asked the core to stop this stream. Continuing would feed the same text back to
+        # whatever triggered the ask, so the turn ends here and the reason says who asked.
+        line, user_response, error = _PLUGIN_STREAM_CUT
+        agent._vprint(f"{agent.log_prefix}{line}: {plugin_cut}", force=True, diagnostic=True)
+        return st.end_turn(user_response, error)
     if getattr(response, "_runaway_repetition", False):
         # The streaming call cut a live repetition loop: a continuation would only re-enter it,
         # whatever the partial or its tool calls look like.
