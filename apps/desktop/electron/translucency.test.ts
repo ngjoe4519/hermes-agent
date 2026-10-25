@@ -325,16 +325,21 @@ describe('backgroundMaterialFor', () => {
 })
 
 describe('translucencySupportedOn', () => {
-  it('covers the two platforms where setOpacity or a native material exists', () => {
+  it('covers every platform with at least one working half', () => {
     expect(translucencySupportedOn('darwin')).toBe(true)
     expect(translucencySupportedOn('win32')).toBe(true)
+    // Clear rides setOpacity. The docs still describe that as a Windows/macOS
+    // API, but Chromium's Ozone X11 (_NET_WM_WINDOW_OPACITY) and Wayland
+    // backends honour it — measured on Electron 44, where a Linux window
+    // really does fade.
+    expect(translucencySupportedOn('linux')).toBe(true)
   })
 
-  // Electron documents setOpacity as doing nothing on Linux, and there is no
-  // material either — so the setting has no working half to offer there.
-  it('is off on Linux, where neither mode does anything', () => {
-    expect(translucencySupportedOn('linux')).toBe(false)
+  // Glass still needs a first-party material, so Linux gets Clear and nothing
+  // else; a platform with neither half gets no row at all.
+  it('is off where neither half exists', () => {
     expect(translucencySupportedOn('freebsd')).toBe(false)
+    expect(glassSupportedOn('linux')).toBe(false)
   })
 })
 
@@ -703,5 +708,52 @@ describe('resolving the book for the painted appearance', () => {
 
     expect(resolveTranslucency(book, 'light', false).mode).toBe('clear')
     expect(resolveTranslucency(book, 'dark', false).mode).toBe('clear')
+  })
+})
+
+// The sibling path, and the reason this fix belongs in the DEFAULTS rather than
+// in a per-platform gate: `intensity` is the renderer's surface tint under glass
+// and the native window opacity under clear, so the glass default (29) must
+// never stand in for a clear one. Every platform that cannot back glass —
+// Linux, and Windows 10 below the 22H2 floor — resolves `mode: 'clear'`, and
+// both faded the whole window (text included) to 0.94113 on a fresh profile.
+describe('clear mode never inherits the glass tint default', () => {
+  const untouched = (glassSupported: boolean) => normalizeBook(null, glassSupported)
+
+  it('starts a Windows 10 profile fully opaque', () => {
+    const state = resolveTranslucency(untouched(false), 'dark', true)
+
+    expect(state).toMatchObject({ mode: 'clear', intensity: 0 })
+    expect(windowOpacityOptions(state)).toStrictEqual({})
+  })
+
+  it('starts a Linux profile fully opaque', () => {
+    const state = resolveTranslucency(untouched(false), 'dark', false)
+
+    expect(state).toMatchObject({ mode: 'clear', intensity: 0 })
+    expect(windowOpacityOptions(state)).toStrictEqual({})
+  })
+
+  // ...while a glass-capable platform keeps the sidebar tint it ships with.
+  it('leaves the glass default alone where glass exists', () => {
+    expect(resolveTranslucency(untouched(true), 'dark', false)).toMatchObject({ mode: 'glass', intensity: 29 })
+    expect(resolveTranslucency(untouched(true), 'dark', true).intensity).toBe(29)
+  })
+
+  // The lever itself still works: a clear value the user actually set survives.
+  it('honours a clear-mode value the user set', () => {
+    const tuned = normalizeBook({ mode: 'clear', intensity: 40 }, false)
+    const state = resolveTranslucency(tuned, 'dark', false)
+
+    expect(state.intensity).toBe(40)
+    expect(windowOpacityOptions(state)).toStrictEqual({ opacity: windowOpacityFor(state) })
+  })
+
+  // First launch has no persisted file either, and main creates the window from
+  // this answer before the renderer has said anything.
+  it('creates a first window opaque wherever glass is unavailable', () => {
+    expect(defaultTranslucencyState('dark', false, true)).toMatchObject({ mode: 'clear', intensity: 0 })
+    expect(defaultTranslucencyState('light', false, false)).toMatchObject({ mode: 'clear', intensity: 0 })
+    expect(defaultTranslucencyState('dark', true, false)).toMatchObject({ mode: 'glass', intensity: 29 })
   })
 })
