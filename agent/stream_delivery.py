@@ -93,6 +93,7 @@ class StreamDeliveryMixin:
         # config read are dropped here and re-created by the next stream that asks for them.
         self._stream_interrupt_request = None
         self._stream_interrupts_enabled = None
+        self._plugin_cut_reason = ""
 
         def deliver(tail: str) -> None:
             # Recorded only once shown (as ``_fire_stream_delta``): a held tail must not become an
@@ -361,6 +362,39 @@ class StreamDeliveryMixin:
         interrupt = getattr(self, "_stream_interrupt_request", None)
         reason = interrupt.reason() if interrupt is not None else ""
         return reason or "a plugin asked the core to stop this stream"
+
+    def _stream_halted(self) -> bool:
+        """True when this response must stop: the user interrupted, or a plugin asked and was allowed."""
+        return bool(getattr(self, "_interrupt_requested", False)) or self._plugin_interrupt_pending()
+
+    def _stream_stop_field(self) -> str:
+        """Close-field name for the wire's stream loop, or "" while the response continues.
+
+        The loop asks one question per chunk, and the answer names what to record when the response
+        is closed: a user interrupt stays the user's, and a plugin's ask is logged with its reason.
+        """
+        if getattr(self, "_interrupt_requested", False):
+            return "interrupt_stream_close_failed"
+        if not self._plugin_interrupt_pending():
+            return ""
+        reason = self._take_plugin_interrupt_reason()
+        self._plugin_cut_reason = reason
+        logger.warning(
+            "%sStream cut at a plugin's request: %s (model=%s, provider=%s).",
+            getattr(self, "log_prefix", ""), reason, getattr(self, "model", "") or "unknown",
+            getattr(self, "provider", "") or "unknown")
+        return "plugin_interrupt_stream_close_failed"
+
+    def _stream_stopped(self, runaway: Any = None) -> bool:
+        """True when this response is being cut: the repetition watch fired, or a plugin's ask won."""
+        return bool(runaway) or bool(getattr(self, "_plugin_cut_reason", ""))
+
+    def _stamp_cut(self, response, *, runaway: Any = None) -> None:
+        """Mark a cut response so the turn ends here instead of continuing the rejected text."""
+        if runaway:
+            response._runaway_repetition = True
+        if getattr(self, "_plugin_cut_reason", ""):
+            response._plugin_interrupt_reason = self._plugin_cut_reason
 
     def _stream_hook_base_payload(self) -> dict[str, Any]:
         return {

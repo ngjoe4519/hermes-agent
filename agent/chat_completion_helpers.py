@@ -3053,8 +3053,6 @@ class _StreamingCall(StreamingWaitMonitor):
         # field is persisted either way and need not mirror the details.
         detail_watch = RunawayStreamWatch()
         runaway = None
-        # Set when a plugin asked the core to cut this stream (payload["interrupt"]).
-        plugin_cut = None
 
         llamacpp = _streams_llamacpp(self.agent)
 
@@ -3093,13 +3091,8 @@ class _StreamingCall(StreamingWaitMonitor):
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
             is_progress = self._take_chunk(_diag, chunk, llamacpp)
-            if self.agent._interrupt_requested:
-                _close_half_read_stream("interrupt_stream_close_failed")
-                break
-            if self.agent._plugin_interrupt_pending():
-                # The plugin only asked; this check is the core deciding to honour it.
-                plugin_cut = self.agent._take_plugin_interrupt_reason()
-                _close_half_read_stream("plugin_interrupt_stream_close_failed")
+            if stop_field := self.agent._stream_stop_field():
+                _close_half_read_stream(stop_field)
                 break
             if not self._stream_attempt_is_active(stream_attempt_id):
                 self._discard_stale_stream_chunk(stream_attempt_id, chunk)
@@ -3209,11 +3202,6 @@ class _StreamingCall(StreamingWaitMonitor):
         if runaway:
             _close_half_read_stream("runaway_stream_close_failed")
             self._log_runaway_cut(runaway)
-        if plugin_cut:
-            logger.warning(
-                "%sStream cut at a plugin's request: %s (model=%s, provider=%s).",
-                getattr(self.agent, "log_prefix", ""), plugin_cut,
-                self.api_kwargs.get("model", "unknown"), getattr(self.agent, "provider", "") or "unknown")
         tool_calls.materialize()
         self._close_managed_stream()
         if self._stream_attempt_was_cancelled(stream_attempt_id):
@@ -3221,19 +3209,16 @@ class _StreamingCall(StreamingWaitMonitor):
         if stream.final_response is not None:
             return self._adopt_final_response(stream.final_response)
         response = self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
-            "length" if (runaway or plugin_cut) else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
+            "length" if self.agent._stream_stopped(runaway) else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
             refusal_parts=refusal_parts)
-        carriers.apply(response)
-        if runaway:
-            # Cut, not finished: the length path ends the turn on this mark instead of continuing.
-            response._runaway_repetition = True
-        if plugin_cut:
-            # Same hand-off as the runaway cut, with the reason kept for the turn to report.
-            response._plugin_interrupt_reason = plugin_cut
+        carriers.apply(response)  # then mark the cut, so the length path ends the turn here
+        self.agent._stamp_cut(response, runaway=runaway)
         return response
 
     def _log_runaway_cut(self, channel: str) -> None:
+        if not channel:
+            return
         logger.warning(
             "%sStream cut: the %s turned into a runaway repetition loop (model=%s, provider=%s).",
             getattr(self.agent, "log_prefix", ""), channel, self.api_kwargs.get("model", "unknown"),
@@ -3407,7 +3392,6 @@ class _StreamingCall(StreamingWaitMonitor):
         base_final_message = None
         text_watch, thinking_watch = RunawayStreamWatch(), RunawayStreamWatch()
         runaway = None
-        plugin_cut = None  # a plugin's request to cut this stream, once the core honours it
 
         from agent import relay_llm
         from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
@@ -3439,10 +3423,7 @@ class _StreamingCall(StreamingWaitMonitor):
             for event in stream:
                 saw_stream_event = True
                 self._count_chunk(_diag, event)
-                if self.agent._interrupt_requested:
-                    break
-                if self.agent._plugin_interrupt_pending():
-                    plugin_cut = self.agent._take_plugin_interrupt_reason()
+                if self.agent._stream_stop_field():
                     break
                 event_type = getattr(event, "type", None)
                 if event_type == "message_stop":
@@ -3474,7 +3455,7 @@ class _StreamingCall(StreamingWaitMonitor):
                             runaway = "reasoning"
                             break
             raw_stream = _stream_context["stream"]
-            if not self.agent._interrupt_requested and not plugin_cut and raw_stream is not None and not runaway:
+            if not self.agent._stream_halted() and raw_stream is not None and not runaway:
                 if not saw_message_stop:
                     raise EmptyStreamError(
                         "Anthropic Messages stream ended before message_stop (possible upstream stream drop)."
@@ -3496,21 +3477,12 @@ class _StreamingCall(StreamingWaitMonitor):
 
         if self.agent._interrupt_requested:
             return None
-        if plugin_cut:
-            logger.warning("%sStream cut at a plugin's request: %s (anthropic wire).",
-                           getattr(self.agent, "log_prefix", ""), plugin_cut)
-            # No message_stop, so no final message: the SDK's snapshot is what streamed so far.
-            raw_stream = _stream_context["stream"]
-            message = accumulator.response(getattr(raw_stream, "current_message_snapshot", None))
-            message.stop_reason = "max_tokens"
-            message._plugin_interrupt_reason = plugin_cut
-            return message
-        if runaway:
+        if self.agent._stream_stopped(runaway):
             self._log_runaway_cut(runaway)
             # No message_stop, so no final message: the SDK's snapshot is what streamed so far.
-            message = accumulator.response(_stream_context["stream"].current_message_snapshot)
+            message = accumulator.response(getattr(_stream_context["stream"], "current_message_snapshot", None))
             message.stop_reason = "max_tokens"
-            message._runaway_repetition = True  # same hand-off as the chat_completions wire
+            self.agent._stamp_cut(message, runaway=runaway)
             return message
         if base_final_message is not None:
             self._check_anthropic_message(base_final_message, tool_drop=False)
