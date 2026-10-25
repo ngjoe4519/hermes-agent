@@ -296,7 +296,7 @@ class _SlowEndpoint:
                     for frame in frames:
                         self.wfile.write(frame.encode())
                         self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass  # the core closed the stream early, which is the point of the cut test
 
             def log_message(self, *args):
