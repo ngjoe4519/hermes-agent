@@ -170,7 +170,7 @@ def test_the_turn_ends_on_the_plugin_cut_instead_of_continuing(monkeypatch):
     )
 
     assert verdict == "ended"
-    assert ended["error"] == "plugin_stream_interrupt"
+    assert ended["error"].startswith("A plugin asked the core to cut this stream")
     assert "degeneracy-guard: degenerate loop" in printed[0]
 
 

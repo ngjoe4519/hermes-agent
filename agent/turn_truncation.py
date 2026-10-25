@@ -138,7 +138,7 @@ _PLUGIN_STREAM_CUT = (
     "asked the core to stop it, so the stream was cut instead of running on. The partial response was "
     "discarded.\n\n→ Switch to a different model with `/model`\n"
     "→ Or resend your message (your conversation history is preserved)",
-    "plugin_stream_interrupt",
+    "A plugin asked the core to cut this stream, so the response was stopped and the partial text discarded.",
 )
 _CEILING_NO_TEXT = (
     "⚠️ **No visible answer was produced.** The model hit its output-token limit on every "
