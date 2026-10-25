@@ -321,8 +321,9 @@ class StreamDeliveryMixin:
     def _plugin_stream_interrupt(self):
         """The request object handed to plugin stream hooks for the CURRENT model response.
 
-        Created on first use so a turn that registers no stream hooks pays nothing. The object only
-        carries an ask; honouring it is the core's decision (see ``_plugin_interrupt_pending``).
+        One object per model response, shared by every hook event in it, so a stream of deltas
+        allocates nothing extra after the first. The object only carries an ask; honouring it is
+        the core's decision (see ``_plugin_interrupt_pending``).
         """
         interrupt = getattr(self, "_stream_interrupt_request", None)
         if interrupt is None:
