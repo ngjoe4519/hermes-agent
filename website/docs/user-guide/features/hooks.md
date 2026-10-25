@@ -522,7 +522,7 @@ Common fields for all four hooks:
 | `model` | `str` | Active model identifier |
 | `provider` | `str` | Active provider name |
 | `surface` | `str` | Calling surface, e.g. `cli`, `discord`, `telegram` |
-| `interrupt` | `StreamInterruptRequest` | Ask the core to cut this stream — see [Asking the core to cut a stream](#asking-the-core-to-cut-a-stream) |
+| `interrupt` | `StreamInterruptRequest` | Ask the core to cut this stream. See [Asking the core to cut a stream](#asking-the-core-to-cut-a-stream) |
 
 Additional fields:
 
@@ -546,7 +546,7 @@ Return values are ignored. To keep the stream fast, callbacks should enqueue the
 
 #### Asking the core to cut a stream
 
-Stream observers are read-only in one direction only: a plugin may **ask** for the stream to end, but the core decides. The payload carries `interrupt`, and asking is one call:
+Stream observers stay read-only in one direction: a plugin may **ask** for the stream to end, but the core decides. The payload carries `interrupt`, and asking is one call:
 
 ```python
 _WINDOW_WORDS = 240   # how much text we remember
@@ -597,7 +597,7 @@ def register(ctx) -> None:
 
 Two things make this example work where a per-delta pattern match does not. The guard keeps a window across deltas, because a single delta is only a few tokens and the repeat you care about spans dozens. And it compares word blocks instead of running a regex with a backreference, so the cost per delta stays flat as the window fills.
 
-`request()` only sets a flag — it never waits, never calls back into the agent, and never touches the token path. It returns `True` the first time and `False` afterwards, so a second observer cannot rewrite the reason. The core checks the flag between chunks; when it fires, the stream closes and the turn ends with the plugin's reason instead of continuing the text the plugin objected to.
+`request()` only sets a flag. It never waits, never calls back into the agent, and never touches the token path. It returns `True` the first time and `False` afterwards, so a second observer cannot rewrite the reason. The core checks the flag between chunks; when it fires, the stream closes and the turn ends with the plugin's reason instead of continuing the text the plugin objected to.
 
 Honouring the ask needs an explicit opt-in, because a plugin ending your responses early is a policy you grant, not one it grants itself:
 
@@ -606,7 +606,7 @@ plugins:
   stream_interrupt_requests: true
 ```
 
-With the setting off (the default) the flag is still recorded — a plugin can keep its own telemetry — but the stream runs to completion. Interrupts are honoured on the `chat_completions` and `anthropic` wires; on other wires the ask is recorded and ignored.
+With the setting off (the default) the flag is still recorded, so a plugin can keep its own telemetry, but the stream runs to completion. Interrupts are honoured on the `chat_completions` and `anthropic` wires; on other wires the ask is recorded and ignored.
 
 ---
 
