@@ -549,17 +549,53 @@ Return values are ignored. To keep the stream fast, callbacks should enqueue the
 Stream observers are read-only in one direction only: a plugin may **ask** for the stream to end, but the core decides. The payload carries `interrupt`, and asking is one call:
 
 ```python
-import re
+_WINDOW_WORDS = 240   # how much text we remember
+_REPEATS = 4          # the same block this many times in a row is not prose
+_MAX_PERIOD = 8       # longest block worth testing (words)
 
-_WINDOW = re.compile(r"(\b\w+\b)(?:\s+\1\b){12,}", re.IGNORECASE)
 
-def on_delta(delta, kind, interrupt, **kwargs):
-    if kind == "text" and _WINDOW.search(delta):
-        interrupt.request("repeated a phrase for 12+ words", source="degeneracy-guard")
+class DegeneracyGuard:
+    """Accumulate a sliding window of text; ask for a cut once the same block repeats."""
 
-def register(ctx):
-    ctx.register_hook("on_stream_delta", on_delta)
+    def __init__(self) -> None:
+        self._tail = ""
+
+    def reset(self) -> None:
+        self._tail = ""
+
+    def observe(self, delta: str) -> str | None:
+        words = (self._tail + " " + delta).split()[-_WINDOW_WORDS:]
+        self._tail = " ".join(words)
+        for period in range(1, _MAX_PERIOD + 1):
+            if len(words) < period * _REPEATS:
+                continue
+            blocks = [words[-period * (index + 1):][:period] for index in range(_REPEATS)]
+            if all(block == blocks[0] for block in blocks):
+                return "the same phrase repeated four times in a row"
+        return None
+
+
+_guard = DegeneracyGuard()
+
+
+def on_stream_start(**_kwargs) -> None:
+    _guard.reset()
+
+
+def on_stream_delta(delta: str, kind: str, interrupt=None, **_kwargs) -> None:
+    if kind != "text":
+        return
+    reason = _guard.observe(delta)
+    if reason and interrupt is not None:
+        interrupt.request(reason, source="degeneracy-guard")
+
+
+def register(ctx) -> None:
+    ctx.register_hook("on_stream_start", on_stream_start)
+    ctx.register_hook("on_stream_delta", on_stream_delta)
 ```
+
+Two things make this example work where a per-delta pattern match does not. The guard keeps a window across deltas, because a single delta is only a few tokens and the repeat you care about spans dozens. And it compares word blocks instead of running a regex with a backreference, so the cost per delta stays flat as the window fills.
 
 `request()` only sets a flag — it never waits, never calls back into the agent, and never touches the token path. It returns `True` the first time and `False` afterwards, so a second observer cannot rewrite the reason. The core checks the flag between chunks; when it fires, the stream closes and the turn ends with the plugin's reason instead of continuing the text the plugin objected to.
 

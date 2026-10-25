@@ -130,9 +130,14 @@ _REPETITION_STREAM_CUT = repetition_copy(
     "so the stream was stopped instead of running on. The partial response was discarded.",
     " and the stream was cut mid-loop; discarding the",
 )
+# Same three-part shape as repetition_copy(): log line, user copy, error. A plugin's cut is not a
+# repetition, so the words differ, but the layout stays identical to the neighbouring stop paths.
 _PLUGIN_STREAM_CUT = (
-    "Stream cut at the request of a plugin",
-    "The stream was stopped because a plugin asked the core to. The partial response was discarded.",
+    "🛑 Stream cut at the request of a plugin.",
+    "⚠️ **Response Stopped — A Plugin Asked to Cut the Stream**\n\nA plugin watching this response "
+    "asked the core to stop it, so the stream was cut instead of running on. The partial response was "
+    "discarded.\n\n→ Switch to a different model with `/model`\n"
+    "→ Or resend your message (your conversation history is preserved)",
     "plugin_stream_interrupt",
 )
 _CEILING_NO_TEXT = (

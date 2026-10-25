@@ -9,10 +9,14 @@ The agent here is a stub carrying only the delivery mixin: the contract under te
 the flag, and constructing a real AIAgent would read the developer's own config for no extra coverage.
 """
 
+import json
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 
 class _StubAgentMixin:
@@ -245,3 +249,204 @@ def test_an_ask_from_a_hook_worker_reaches_the_core_gate(monkeypatch):
 
     assert agent._plugin_interrupt_pending() is True
     assert agent._take_plugin_interrupt_reason().startswith("degeneracy-guard: ")
+
+
+# --- channel level: the wire's stream loop really stops -------------------------------
+#
+# The tests above cover the latch and the turn's ending. These drive both wires end to end
+# with a local endpoint, so the middle link is covered too: the loop asks the question between
+# chunks, and stops where the plugin asked instead of reading the rest of the stream.
+
+_CHUNK_TOTAL = 120
+_CHUNKS = [f"item {n}: this backlog entry has its own wording, its own owner and its own date.\n"
+           for n in range(_CHUNK_TOTAL)]
+_FULL_TEXT = "".join(_CHUNKS)
+
+
+class _SlowEndpoint:
+    """Local SSE endpoint (chat + anthropic wires) that writes the reply slowly on purpose, so a
+    plugin's ask has somewhere to land between two chunks."""
+
+    def __init__(self, chunk_pause: float = 0.004) -> None:
+        self.requests = 0
+        self.chunk_pause = chunk_pause
+        endpoint = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # model metadata probes
+                body = json.dumps({"object": "list", "data": [
+                    {"id": "fixture-local", "object": "model", "context_length": 131072}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                endpoint.requests += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                frames = endpoint._anthropic_frames() if self.path.endswith("/messages") else endpoint._chat_frames()
+                try:
+                    for frame in frames:
+                        self.wfile.write(frame.encode())
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the core closed the stream early, which is the point of the cut test
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self._server.server_port}/v1"
+
+    def _chat_frames(self):
+        for chunk in _CHUNKS:
+            yield "data: " + json.dumps({
+                "id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 0,
+                "model": "fixture-local",
+                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+            }) + "\n\n"
+            time.sleep(self.chunk_pause)
+        yield "data: " + json.dumps({
+            "id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 0,
+            "model": "fixture-local",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    def _anthropic_frames(self):
+        def event(kind, **payload):
+            return f"event: {kind}\ndata: {json.dumps({'type': kind, **payload})}\n\n"
+
+        yield event("message_start", message={
+            "id": "msg_fixture", "type": "message", "role": "assistant", "model": "fixture-local",
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0}})
+        yield event("content_block_start", index=0, content_block={"type": "text", "text": ""})
+        for chunk in _CHUNKS:
+            yield event("content_block_delta", index=0, delta={"type": "text_delta", "text": chunk})
+            time.sleep(self.chunk_pause)
+        yield event("content_block_stop", index=0)
+        yield event("message_delta", delta={"stop_reason": "end_turn", "stop_sequence": None},
+                    usage={"output_tokens": 1})
+        yield event("message_stop")
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _ask_at(nth: int):
+    """A stream hook that asks for a cut on its nth text delta, counting what it sees."""
+    seen = {"deltas": 0}
+
+    def on_stream_delta(delta=None, kind=None, interrupt=None, **_kwargs):
+        if kind != "text":
+            return
+        seen["deltas"] += 1
+        if seen["deltas"] == nth and interrupt is not None:
+            interrupt.request("the same block is repeating", source="test-guard")
+
+    return on_stream_delta, seen
+
+
+def _run_wire_turn(monkeypatch, server, api_mode, *, enabled):
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="fixture-local", provider="custom", base_url=server.url, api_key="fixture",
+        api_mode=api_mode, quiet_mode=True, skip_memory=True, skip_context_files=True,
+        enabled_toolsets=[], max_iterations=1,
+    )
+    delivered = {"text": 0}
+
+    def count(text):
+        delivered["text"] += 1
+        return True
+
+    agent.stream_delta_callback = count
+    # The config key is read per response, so patching it after construction exercises the real
+    # lookup without handing a fake config to the agent's own setup.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"plugins": {"stream_interrupt_requests": enabled}},
+    )
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["result"] = agent.run_conversation("Summarize the backlog.")
+        except BaseException as exc:  # surfaced below on the test thread
+            outcome["error"] = exc
+
+    turn = threading.Thread(target=run, daemon=True)
+    turn.start()
+    turn.join(60)
+    if turn.is_alive():
+        agent.interrupt("test bound reached")
+        turn.join(10)
+        pytest.fail("turn still streaming after 60s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"], delivered["text"]
+
+
+@pytest.fixture()
+def wire(monkeypatch):
+    from agent.plugin_stream_hooks import shutdown_plugin_stream_hook_dispatcher
+
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    shutdown_plugin_stream_hook_dispatcher()
+    servers: list[_SlowEndpoint] = []
+
+    def start(hook_at: int | None = None) -> tuple[_SlowEndpoint, dict]:
+        server = _SlowEndpoint()
+        servers.append(server)
+        seen = {}
+        if hook_at is not None:
+            callback, seen = _ask_at(hook_at)
+            monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks",
+                                lambda name: (callback,) if name == "on_stream_delta" else ())
+        return server, seen
+
+    yield start
+    shutdown_plugin_stream_hook_dispatcher()
+    for server in servers:
+        server.close()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+def test_the_stream_loop_stops_where_the_plugin_asked(monkeypatch, wire, api_mode):
+    server, _seen = wire(hook_at=8)
+
+    result, delivered = _run_wire_turn(monkeypatch, server, api_mode, enabled=True)
+
+    assert (result["completed"], result["failure_reason"]) == (False, "truncated")
+    assert "A Plugin Asked to Cut the Stream" in result["final_response"]
+    # The loop stopped near the ask instead of reading all 120 chunks: that is the link these
+    # tests exist for. Slack covers deltas already in flight when the ask landed.
+    assert delivered < _CHUNK_TOTAL // 2
+    assert server.requests == 1
+    assert _CHUNKS[-1].strip() not in result["final_response"]
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+def test_the_same_ask_is_recorded_and_ignored_when_the_setting_is_off(monkeypatch, wire, api_mode):
+    server, seen = wire(hook_at=8)
+
+    result, delivered = _run_wire_turn(monkeypatch, server, api_mode, enabled=False)
+
+    assert result["completed"] is True
+    assert result["final_response"].strip() == _FULL_TEXT.strip()
+    assert delivered == _CHUNK_TOTAL
+    assert seen["deltas"] == _CHUNK_TOTAL  # the plugin still saw everything it asked about
