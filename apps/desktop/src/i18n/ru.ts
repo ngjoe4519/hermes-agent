@@ -141,6 +141,7 @@ export const ruOverrides = {
       openaiTtsNeedsKey: 'Для TTS OpenAI нужен VOICE_TOOLS_OPENAI_KEY или OPENAI_API_KEY.'
     },
     voice: {
+      echoDropped: 'Эхо воспроизводимого звука проигнорировано. Попробуйте сказать ещё раз.',
       configureSpeechToText: 'Настройте распознавание речи, чтобы использовать голосовой режим.',
       couldNotStartSession: 'Не удалось начать голосовой сеанс',
       microphoneAccessDenied: 'Доступ к микрофону запрещён.',
@@ -681,6 +682,7 @@ export const ruOverrides = {
         maxSnapshots: 'Лимит чекпоинтов'
       },
       voice: {
+        bargeInThresholdMultiplier: 'Порог прерывания',
         maxRecordingSeconds: 'Макс. длительность записи',
         autoTts: 'Зачитывать ответы вслух'
       },
@@ -852,6 +854,8 @@ export const ruOverrides = {
         }
       },
       voice: {
+        bargeInThresholdMultiplier:
+          'Чувствительность прерывания ответа в цепочном голосовом режиме. Укажите положительное число: меньшие значения улавливают более тихую речь, но могут захватывать звук динамиков. По умолчанию: 3.',
         autoTts: 'Автоматически зачитывать ответы ассистента.'
       },
       tts: {
