@@ -258,18 +258,19 @@ def test_an_ask_from_a_hook_worker_reaches_the_core_gate(monkeypatch):
 # chunks, and stops where the plugin asked instead of reading the rest of the stream.
 
 _CHUNK_TOTAL = 120
+_CHUNK_GATE_AT = 8   # the stream pauses here until the hook has had its say
 _CHUNKS = [f"item {n}: this backlog entry has its own wording, its own owner and its own date.\n"
            for n in range(_CHUNK_TOTAL)]
 _FULL_TEXT = "".join(_CHUNKS)
 
 
-class _SlowEndpoint:
-    """Local SSE endpoint (chat + anthropic wires) that writes the reply slowly on purpose, so a
-    plugin's ask has somewhere to land between two chunks."""
+class _WireEndpoint:
+    """Local SSE endpoint for both wires. It holds the stream open at ``_CHUNK_GATE_AT`` until the
+    hook has asked, so the ask always lands mid-stream: the test never races a clock."""
 
-    def __init__(self, chunk_pause: float = 0.004) -> None:
+    def __init__(self) -> None:
         self.requests = 0
-        self.chunk_pause = chunk_pause
+        self.gate = threading.Event()
         endpoint = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -307,14 +308,19 @@ class _SlowEndpoint:
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self._server.server_port}/v1"
 
+    def _pause_for_the_ask(self, index: int) -> None:
+        """Block at the gate until the plugin has spoken (bounded, so a broken hook cannot hang CI)."""
+        if index + 1 == _CHUNK_GATE_AT:
+            self.gate.wait(timeout=5.0)
+
     def _chat_frames(self):
-        for chunk in _CHUNKS:
+        for index, chunk in enumerate(_CHUNKS):
             yield "data: " + json.dumps({
                 "id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 0,
                 "model": "fixture-local",
                 "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
             }) + "\n\n"
-            time.sleep(self.chunk_pause)
+            self._pause_for_the_ask(index)
         yield "data: " + json.dumps({
             "id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 0,
             "model": "fixture-local",
@@ -331,9 +337,9 @@ class _SlowEndpoint:
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 1, "output_tokens": 0}})
         yield event("content_block_start", index=0, content_block={"type": "text", "text": ""})
-        for chunk in _CHUNKS:
+        for position, chunk in enumerate(_CHUNKS):
             yield event("content_block_delta", index=0, delta={"type": "text_delta", "text": chunk})
-            time.sleep(self.chunk_pause)
+            self._pause_for_the_ask(position)
         yield event("content_block_stop", index=0)
         yield event("message_delta", delta={"stop_reason": "end_turn", "stop_sequence": None},
                     usage={"output_tokens": 1})
@@ -344,8 +350,8 @@ class _SlowEndpoint:
         self._server.server_close()
 
 
-def _ask_at(nth: int):
-    """A stream hook that asks for a cut on its nth text delta, counting what it sees."""
+def _ask_at(nth: int, server: "_WireEndpoint"):
+    """A stream hook that asks for a cut on its nth text delta, then lets the stream continue."""
     seen = {"deltas": 0}
 
     def on_stream_delta(delta=None, kind=None, interrupt=None, **_kwargs):
@@ -354,6 +360,7 @@ def _ask_at(nth: int):
         seen["deltas"] += 1
         if seen["deltas"] == nth and interrupt is not None:
             interrupt.request("the same block is repeating", source="test-guard")
+            server.gate.set()
 
     return on_stream_delta, seen
 
@@ -407,14 +414,14 @@ def wire(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     shutdown_plugin_stream_hook_dispatcher()
-    servers: list[_SlowEndpoint] = []
+    servers: list[_WireEndpoint] = []
 
-    def start(hook_at: int | None = None) -> tuple[_SlowEndpoint, dict]:
-        server = _SlowEndpoint()
+    def start(hook_at: int | None = None) -> tuple[_WireEndpoint, dict]:
+        server = _WireEndpoint()
         servers.append(server)
         seen = {}
         if hook_at is not None:
-            callback, seen = _ask_at(hook_at)
+            callback, seen = _ask_at(hook_at, server)
             monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks",
                                 lambda name: (callback,) if name == "on_stream_delta" else ())
         return server, seen
