@@ -3697,8 +3697,9 @@ export const deOverrides = {
       thisMonth: 'Diesen Monat früher'
     },
     statusDivider: {
+      attention: 'Handlungsbedarf',
       working: 'In Arbeit',
-      done: 'Erledigt'
+      idle: 'Inaktiv'
     },
     markAllRead: 'Alle als gelesen markieren'
   },
