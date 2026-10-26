@@ -338,6 +338,7 @@ import {
 } from './linux-gpu-fallback'
 import { notifyLauncherWindowRevealed } from './linux-launcher-ready'
 import {
+  clearNvidiaEglBootMarker,
   decideNvidiaEglFallback,
   nvidiaEglFallbackMarker,
   nvidiaEglMarkerAfterSuccessfulBoot,
@@ -347,6 +348,7 @@ import {
   shouldRelaunchForNvidiaGpuDeath,
   writeNvidiaEglMarker
 } from './linux-nvidia-egl-fallback'
+import { relaunchIfNoSandboxCameTooLate } from './linux-sandbox-relaunch'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
 import { resolveIpcFileReadPath, resolveMediaStreamFile, resolvePreviewTargetPath } from './local-read-path'
 import { localSkinProfileKey, readLocalSkinPayload } from './local-skin'
@@ -534,7 +536,7 @@ import {
 } from './remote-ws-headers'
 import { enableRendererAccessibility } from './renderer-accessibility'
 import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle'
-import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
+import { applyLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import { fetchRosterSourceData } from './roster-source-fetch'
@@ -897,10 +899,9 @@ const NVIDIA_EGL_FALLBACK = decideNvidiaEglFallback({
 
 nvidiaEglFallbackActive = NVIDIA_EGL_FALLBACK.enable
 
-// Persist the launch decision before GPU children start: a `booting` marker
-// left behind by a launch that never reached first paint is itself evidence
-// of a GPU death (the "GPU process isn't usable" FATAL abort wins the race
-// against our relaunch handler), and the next launch engages from it.
+// Persist the launch decision before GPU children start: a `booting` marker left by a launch
+// that never reached first paint is evidence of a GPU death (the "GPU process isn't usable"
+// FATAL abort wins the race against our relaunch handler), and the next launch engages from it.
 if (NVIDIA_DRIVER_MAJOR !== null) {
   try {
     writeNvidiaEglMarker(app.getPath('userData'), NVIDIA_EGL_FALLBACK.nextMarker)
@@ -1314,17 +1315,12 @@ let desktopSshPathOverride = ''
     process.env.HERMES_DESKTOP_RENDERER_ACCESSIBILITY = '0'
   }
 
-  for (const planned of planLaunchSwitches(desktopLaunchConfig, process.argv.slice(1))) {
-    if (planned.value === undefined) {
-      app.commandLine.appendSwitch(planned.name)
-    } else {
-      app.commandLine.appendSwitch(planned.name, planned.value)
-    }
+  applyLaunchSwitches(app.commandLine, desktopLaunchConfig, process.argv.slice(1))
+}
 
-    console.log(
-      `[hermes] desktop launch switch from config.yaml: --${planned.name}${planned.value === undefined ? '' : `=${planned.value}`}`
-    )
-  }
+// Linux: a runtime `--no-sandbox` kills renderers on /dev/shm (linux-sandbox-relaunch.ts).
+if (isPrimaryInstance) {
+  relaunchIfNoSandboxCameTooLate(app, () => clearNvidiaEglBootMarker(app.getPath('userData'), NVIDIA_EGL_FALLBACK))
 }
 
 // ACTIVE_HERMES_ROOT — the canonical mutable Hermes install. Same path

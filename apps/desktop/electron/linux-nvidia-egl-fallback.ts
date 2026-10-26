@@ -315,3 +315,21 @@ export function nvidiaEglMarkerAfterSuccessfulBoot(options: {
 
   return { state: 'ok' }
 }
+
+/**
+ * A deliberate exit before the first window (the runtime --no-sandbox restart)
+ * settles this launch's `booting` probe as `ok`; left behind, the next launch
+ * reads it as a GPU abort mid-boot and forces SwiftShader. A fallback, sticky or
+ * engaged this launch, is left as it is.
+ */
+export function clearNvidiaEglBootMarker(userDataDir: string, decision: NvidiaEglFallbackDecision): void {
+  if (decision.enable || readNvidiaEglMarker(userDataDir)?.state !== 'booting') {
+    return
+  }
+
+  try {
+    writeNvidiaEglMarker(userDataDir, { state: 'ok' })
+  } catch {
+    void 0
+  }
+}
