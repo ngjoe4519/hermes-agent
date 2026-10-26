@@ -201,6 +201,7 @@ hermes skills uninstall <skill-name>
 | Skill | Description |
 |-------|-------------|
 | [**mpp-agent**](../user-guide/skills/optional/payments/payments-mpp-agent.md) | Pay HTTP 402 APIs via Machine Payments Protocol (MPP). |
+| [**spend-gate**](../user-guide/skills/optional/payments/payments-spend-gate.md) | Use before the agent spends money: quote, confirm, receipt. |
 | [**stripe-link-cli**](../user-guide/skills/optional/payments/payments-stripe-link-cli.md) | Agent payments via Stripe Link — cards, SPT, approvals. |
 | [**stripe-projects**](../user-guide/skills/optional/payments/payments-stripe-projects.md) | Provision SaaS services + sync creds via Stripe Projects. |
 
@@ -244,8 +245,11 @@ hermes skills uninstall <skill-name>
 | Skill | Description |
 |-------|-------------|
 | [**1password**](../user-guide/skills/optional/security/security-1password.md) | Set up op CLI, sign in, and read or inject secrets. |
+| [**application-threat-model**](../user-guide/skills/optional/security/security-application-threat-model.md) | Use when threat-modeling an app: assets, STRIDE, controls. |
+| [**data-share-review**](../user-guide/skills/optional/security/security-data-share-review.md) | Use when data leaves the team; minimize, mask, scan for PII. |
 | [**godmode**](../user-guide/skills/optional/security/security-godmode.md) | Jailbreak LLMs: Parseltongue, GODMODE, ULTRAPLINIAN. |
 | [**oss-forensics**](../user-guide/skills/optional/security/security-oss-forensics.md) | GitHub supply-chain forensics: recovery, IOCs, reporting. |
+| [**security-event-response**](../user-guide/skills/optional/security/security-security-event-response.md) | Use when a CVE, leaked secret or license issue hits code. |
 | [**sherlock**](../user-guide/skills/optional/security/security-sherlock.md) | Find accounts for a username across 400+ platforms. |
 | [**unbroker**](../user-guide/skills/optional/security/security-unbroker.md) | Autonomously remove your info from data-broker sites. |
 | [**web-pentest**](../user-guide/skills/optional/security/security-web-pentest.md) | Authorized web pentest: recon, proof-based exploits, report. |
@@ -272,11 +276,13 @@ hermes skills uninstall <skill-name>
 | [**pr-lens**](../user-guide/skills/optional/software-development/software-development-pr-lens.md) | Draw code changes as animated architecture/data-flow SVGs. |
 | [**rest-graphql-debug**](../user-guide/skills/optional/software-development/software-development-rest-graphql-debug.md) | Debug REST/GraphQL APIs: status codes, auth, schemas, repro. |
 | [**subagent-driven-development**](../user-guide/skills/optional/software-development/software-development-subagent-driven-development.md) | Execute plans via delegate_task subagents (2-stage review). |
+| [**tech-debt-audit**](../user-guide/skills/optional/software-development/software-development-tech-debt-audit.md) | Use when ranking tech debt into a cited, rerunnable ledger. |
 
 ## web-development
 
 | Skill | Description |
 |-------|-------------|
+| [**accessibility-audit**](../user-guide/skills/optional/web-development/web-development-accessibility-audit.md) | Use when auditing a UI for WCAG 2.2 AA, keyboard and AT. |
 | [**cloudflare-temporary-deploy**](../user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy.md) | Deploy a Worker live, no account, via wrangler --temporary. |
 | [**har-derived-api-client**](../user-guide/skills/optional/web-development/web-development-har-derived-api-client.md) | Record a site's XHR into a HAR, derive an HTTP client. |
 | [**page-agent**](../user-guide/skills/optional/web-development/web-development-page-agent.md) | Embed an in-page natural-language GUI copilot in web apps. |
