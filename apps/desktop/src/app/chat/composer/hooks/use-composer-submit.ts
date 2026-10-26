@@ -23,6 +23,7 @@ import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
 import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
 import { hasBlockingPromptRequest } from '@/store/prompts'
+import { $currentCwdExplicit } from '@/store/session'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -32,6 +33,7 @@ import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerSubmitArgs {
+  cwd?: string | null
   activeQueueSessionKey: string | null
   activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
@@ -72,6 +74,7 @@ interface UseComposerSubmitArgs {
  * external-submit listener ref.
  */
 export function useComposerSubmit({
+  cwd,
   activeQueueSessionKey,
   activeQueueSessionKeyRef,
   attachments,
@@ -164,6 +167,8 @@ export function useComposerSubmit({
         ...(attachments ? { attachments } : {}),
         composerScope: submittedScope,
         ...assignment,
+        ...(cwd !== undefined ? { referenceCwd: cwd } : {}),
+        ...(!sessionId ? { referenceCwdExplicit: $currentCwdExplicit.get() } : {}),
         ...(displayKind ? { displayKind } : {})
       })
     )
