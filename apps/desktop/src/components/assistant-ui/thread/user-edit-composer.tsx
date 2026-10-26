@@ -13,6 +13,7 @@ import {
   useState
 } from 'react'
 
+import { COMPOSER_AREAS } from '@/app/chat/composer/contrib'
 import { ComposerDirectiveActions } from '@/app/chat/composer/directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from '@/app/chat/composer/drop-affordance'
 import {
@@ -39,6 +40,7 @@ import { chipTypedPathOnSpace, pathifyRefs } from '@/app/chat/composer/path-refs
 import {
   beginComposerComposition,
   composerPlainText,
+  endComposerComposition,
   insertComposerContentsAtCaret,
   markEditorEmptiness,
   placeCaretEnd,
@@ -69,6 +71,7 @@ import {
   USER_BUBBLE_BASE_CLASS
 } from '@/components/assistant-ui/thread/user-message'
 import { Codicon } from '@/components/ui/codicon'
+import { useContributions } from '@/contrib/react/use-contributions'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { attachmentDisplayText, attachmentId, pathLabel } from '@/lib/chat-runtime'
@@ -127,6 +130,9 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const at = useAtCompletions({ cwd, gateway, sessionId })
   const slash = useSlashCompletions({ gateway, sessionId })
   const emoji = useEmojiCompletions()
+  // Same rule as the main composer: the surface stamps its session address
+  // only while a `composer.nonProse` provider is registered.
+  const nonProseRegistered = useContributions(COMPOSER_AREAS.nonProse).length > 0
 
   // Timers this composer schedules must not outlive it. Every callback below
   // touches component state, a ref or the composer core, and this is the one
@@ -909,11 +915,18 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
                 expanded ? 'min-h-16' : 'min-h-[1.25rem]'
               )}
               contentEditable
+              data-composer-session={nonProseRegistered ? (sessionId ?? '') : undefined}
               data-placeholder={copy.editMessage}
               data-slot={RICH_INPUT_SLOT}
               dir={textDirection}
               onBeforeInput={handleBeforeInput}
-              onBlur={() => scheduleTimeout(closeTrigger, 80)}
+              onBlur={event => {
+                // Same escape as the main composer: a composition never
+                // survives focus loss, and a wedged flag would freeze the
+                // non-prose wrapper set for the rest of the editor's life.
+                endComposerComposition(event.currentTarget)
+                scheduleTimeout(closeTrigger, 80)
+              }}
               onCompositionEnd={event => {
                 composingRef.current = false
                 flushEditorToDraft(event.currentTarget)
