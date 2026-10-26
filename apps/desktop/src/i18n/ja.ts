@@ -24,6 +24,7 @@ import { jaProjects } from './ja_projects'
 import { jaSharedMetrics } from './ja_shared_metrics'
 import { jaThemePicker } from './ja_theme_picker'
 import { jaUpdateChannel } from './ja_update_channel'
+import { jaUpdateWhenIdle } from './ja_update_when_idle'
 
 export const jaOverrides = {
   catalog: jaCatalog,
@@ -2630,6 +2631,7 @@ export const jaOverrides = {
   },
 
   updates: {
+    whenIdle: jaUpdateWhenIdle,
     discontinuedTitle: 'このHermesビルドはサポートされていません',
     discontinuedBody:
       'このHermesビルドはサポートが終了し、動作しなくなる可能性があります。アンインストールしてください。データはディスクに残ります。',
