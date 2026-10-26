@@ -42,6 +42,7 @@ import { $botChatSessionIds, $sessionStates, $sessionTiles, isBotChatSession } f
 import { useForcedTextDirection } from '@/store/text-direction'
 import { $threadScrolledUpBySession } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
+import { $showVoiceControls } from '@/store/voice-controls'
 import { useTheme } from '@/themes'
 
 import { AttachmentList } from './attachments'
@@ -160,6 +161,7 @@ export function ChatBar({
   onTranscribeAudio
 }: ChatBarProps) {
   const hudMode = useStore($hudMode)
+  const showVoiceControls = useStore($showVoiceControls)
   const hudWindowing = window.hermesDesktop?.hud?.windowing
   const hudNativeDrag = hudMode && hudWindowing?.nativeDrag === true
 
@@ -1163,6 +1165,7 @@ export function ChatBar({
       }}
       onSteer={canSteer ? () => steerDraft('steer') : undefined}
       onToggleAutoSpeak={handleToggleAutoSpeak}
+      showVoiceControls={showVoiceControls}
       state={state}
       voiceStatus={voiceStatus}
     />
