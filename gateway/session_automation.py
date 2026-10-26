@@ -399,6 +399,8 @@ def snapshot_automation(authority, adapter, event, identity):
     envelope['automation'].update(notification)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id
+    if getattr(event, '_quiet_plugin_injection', False):
+        envelope['automation']['quiet_plugin_injection'] = True
     identities = event.metadata.get('automation_identities')
     if identities:
         envelope['automation']['identities'] = sorted(set(identities))
@@ -443,6 +445,8 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
         descriptor['identities'] = sorted(set(event.metadata['automation_identities']))
     if getattr(event, '_heartbeat_session_id', None):
         descriptor['heartbeat'] = event._heartbeat_session_id
+    if getattr(event, '_quiet_plugin_injection', False):
+        descriptor['quiet_plugin_injection'] = True
     return {'text': event.text, 'local_automation_v1': descriptor}, entry
 
 
@@ -476,6 +480,8 @@ def restore_local_automation(authority, ref, row):
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
         event._heartbeat_session_id = descriptor['heartbeat']
+    if descriptor.get('quiet_plugin_injection'):
+        event._quiet_plugin_injection = True
     return event
 
 
