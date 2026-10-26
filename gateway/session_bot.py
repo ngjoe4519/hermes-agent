@@ -216,7 +216,7 @@ def displaceable_bot_chat(authority, row):
     unbound CLI/TUI/Desktop row no native open can adopt), else None. Such a row can never be
     adopted (``validate_legacy_row``), renamed (the canonical title is its identity) or renamed
     over the API, so it would refuse every delivery for good. A bound local chat, old local history
-    a native open adopts and a local row a login stamped as its own are never moved."""
+    a native open adopts and a Desktop row a login stamped as its own are never moved."""
     from hermes_state_local import POLICY_PREFIX
     from hermes_state_local_migration import LEGACY_PREFIX
 
@@ -280,7 +280,11 @@ def _kept_local_history(db, row):
     if row.get('source') not in LEGACY_LOCAL_SOURCES:
         return False
     if row.get('user_id') and not legacy_account_label(row):
-        return True
+        # A Desktop row a served login stamped is that login's own chat, adopted in place (#140183).
+        # A stamp on any other local source names no owner this door can reach — it is a submit-only
+        # principal, a foreign stamp is refused, and a bound row is refused by its route — so a row
+        # with no binding at all is unadoptable for everyone and held the title for good (#143715).
+        return row.get('source') == 'desktop' or bool(row.get('chat_id') or row.get('session_key'))
     try:
         validate_legacy_row(db, row)
     except RuntimeStoreError:
