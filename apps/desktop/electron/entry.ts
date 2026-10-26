@@ -9,6 +9,13 @@ import { readDesktopLaunchConfig } from './renderer-heap-flags'
 import { wslgLaunchArgs } from './wslg-launch'
 import { spawnWslgLaunch } from './wslg-launch-process'
 
+// `hermes desktop` asks this binary whether Chromium's namespace sandbox starts under the host's
+// AppArmor policy (#130177). Chromium creates its sandboxed zygote before any JS runs, so reaching
+// this line answers yes; exit before any window, single-instance lock, backend or relaunch.
+if (process.argv.includes('--hermes-sandbox-probe')) {
+  process.exit(0)
+}
+
 function configuredElectronFlags(env: NodeJS.ProcessEnv): string[] {
   // Resolve the home exactly like main.ts does, through the shared resolver:
   // HERMES_DATA_DIR_SUFFIX channel installs and profiles/-rooted HERMES_HOME
