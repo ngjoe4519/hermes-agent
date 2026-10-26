@@ -4,6 +4,10 @@ import type { TranslationOverrides } from './define-locale'
 
 // Shell notices (remote-display toast, butterbar, keep-awake offer), spread into de.ts.
 export const deNotices = {
+  gatewayUpdate: {
+    updating: (target, turns) =>
+      `${target ? `Aktualisierung auf ${target}` : 'Hermes wird aktualisiert'}${turns > 0 ? ` · ${turns} ${turns === 1 ? 'Turn wird' : 'Turns werden'} abgeschlossen` : '…'}`
+  },
   remoteDisplayBanner: {
     message: reason =>
       `Software-Rendering aktiv — Remote-Display erkannt (${reason}). GPU-Beschleunigung ist deaktiviert, um Flackern zu verhindern.`
@@ -46,5 +50,5 @@ export const deNotices = {
   }
 } satisfies Pick<
   TranslationOverrides,
-  'remoteDisplayBanner' | 'butterbar' | 'promptNotices' | 'keepAwakeOffer' | 'billingBlock'
+  'gatewayUpdate' | 'remoteDisplayBanner' | 'butterbar' | 'promptNotices' | 'keepAwakeOffer' | 'billingBlock'
 >
