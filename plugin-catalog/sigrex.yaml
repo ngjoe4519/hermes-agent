@@ -1,7 +1,7 @@
 name: sigrex
 repo: https://github.com/sigrexio/agent-plugin
-sha: c1d654b09a71709c00ca205a12210d868a4ec404
-image: https://raw.githubusercontent.com/sigrexio/agent-plugin/c1d654b09a71709c00ca205a12210d868a4ec404/assets/banner.png
+sha: 05cea6ea3fc2dce28a39e680937dd8d7cb7bfd2b
+image: https://raw.githubusercontent.com/sigrexio/agent-plugin/05cea6ea3fc2dce28a39e680937dd8d7cb7bfd2b/assets/banner.png
 description: 'Build, run and manage sigrex.io trading automation (code and AI strategies, trading
   bots, webhooks and signals across crypto exchanges, DEXs and prediction markets) through the
   official Sigrex MCP server (Streamable HTTP at https://mcp.sigrex.io, OAuth sign-in, no keys in
@@ -14,7 +14,7 @@ maintainer: sigrexio
 tier: community
 category: tools
 docs_url: https://docs.sigrex.io/more/mcp-server
-version: "1.0.4"
+version: "1.2.1"
 platforms: []
 capabilities:
   provides_tools: []
