@@ -1,4 +1,5 @@
 import type { TranslationOverrides } from './define-locale'
+import { zhHantCronControl } from './zh-hant_cron_control'
 
 export const zhHantCommandCenter = {
   commandCenter: {
@@ -442,6 +443,7 @@ export const zhHantCommandCenter = {
   },
 
   cron: {
+    control: zhHantCronControl,
     close: '關閉排程',
     title: '排程工作',
     count: count => `${count} 個工作`,

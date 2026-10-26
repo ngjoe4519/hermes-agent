@@ -343,6 +343,8 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[list[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    # Missed-run policy: true runs one catch-up, false skips; omitted follows the default.
+    catch_up: Optional[StrictBool] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict
