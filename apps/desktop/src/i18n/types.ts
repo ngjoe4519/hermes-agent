@@ -2615,6 +2615,7 @@ catalog: CatalogTranslations
     manage: string
     showRuns: string
     hideRuns: string
+    uncategorized: string
     runHistory: string
     actionsTitle: string
     resume: string
