@@ -24,6 +24,12 @@ BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
+# The @handle Bot Mode shows for a host's default profile, and the body of the 404 a peer returns for
+# a /p/<profile>/ prefix naming no profile it has (UNKNOWN_PROFILE_ERROR in
+# gateway/platforms/api_server_profile_prefix.py; a 'hermes' profile it has but does not serve differs).
+DEFAULT_PROFILE_HANDLE = "hermes"
+_UNKNOWN_PROFILE_ERROR = "Unknown or unconfigured profile"
+
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
@@ -96,6 +102,35 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return url
 
 
+def _peer_lacks_profile(exc: Exception) -> bool:
+    """True only for the peer's own "no such profile" verdict: the 404 its /p/<profile>/ prefix
+    middleware returns before any handler runs. A handler's 404 (unknown run or session) carries
+    ``{"error": {"message": ...}}`` and a transport failure is no verdict at all."""
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 404:
+        return False
+    try:
+        body = json.loads(exc.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("error") == _UNKNOWN_PROFILE_ERROR
+
+
+def _resolve_base(peer: dict, profile: str | None, key: str) -> str:
+    """The mirror a target addresses. Bot Mode shows a peer's default profile as @hermes
+    (#118076), but a peer may also serve a real pre-reservation profile named ``hermes``, which
+    must keep winning — so ``/p/hermes`` is tried first and ``/p/default`` is used only when the
+    peer itself answers that it has no such profile (an older peer has no alias on its side)."""
+    base = _base_url(peer, profile)
+    if profile != DEFAULT_PROFILE_HANDLE:
+        return base
+    try:
+        _request(f"{base}/health", key)
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+        if _peer_lacks_profile(exc):
+            return _base_url(peer, "default")
+    return base
+
+
 def _find_bot_chat(base: str, key: str) -> str | None:
     """The remote canonical Bot Chat's session id, or None.
 
@@ -153,6 +188,11 @@ def _parse_target(target: str) -> tuple[str, str | None]:
         raise ValueError("Peer name required (hermes peer dm <peer>[/<agent>] ...)")
     if profile and not _PROFILE_RE.match(profile):
         raise ValueError(f"Invalid agent/profile name: {profile!r}")
+    if profile:
+        # Profile ids are lowercase (normalize_profile_name); 'box/Hermes' must address the
+        # peer's real 'hermes' profile, never reach the /p/default fallback by case alone.
+        from hermes_cli.profiles import normalize_profile_name
+        profile = normalize_profile_name(profile)
     return peer, profile
 
 
@@ -409,7 +449,7 @@ def cmd_peer(args) -> int:
     except (LookupError, PermissionError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    base = _base_url(peer, profile)
+    base = _resolve_base(peer, profile, key)
     if action in {"status", "stop"}:
         return _peer_run_ctl(args, action, peer_name, profile, base, key)
     message = _message_from_args(args)

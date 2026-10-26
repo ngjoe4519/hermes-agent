@@ -132,7 +132,8 @@ export function createBrowserConnectionBridge({ api, bootstrap }: BrowserConnect
           connectionId: LOCAL_CONNECTION_ID,
           connectionKind: 'local' as const,
           connectionLabel,
-          handle: profile === 'default' ? 'hermes' : profile,
+          // A real 'hermes' profile keeps @hermes; the default answers to @default then.
+          handle: profile === 'default' && !profiles.includes('hermes') ? 'hermes' : profile,
           profile,
           targetProfile: profile
         })),
