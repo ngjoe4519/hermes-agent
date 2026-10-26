@@ -6,8 +6,9 @@
  * shows through:
  *
  * - 'clear' — the main process maps the lever to native window opacity
- *   (`setOpacity`), so the whole window fades, text included. macOS + Windows;
- *   `setOpacity` is a no-op on Linux.
+ *   (`setOpacity`), so the whole window fades, text included. Every platform:
+ *   Electron's Ozone X11 and Wayland backends honour it, so Linux has this
+ *   half (and only this half).
  * - 'glass' — the window stays fully opaque at the native level and the
  *   renderer thins its page surfaces instead, letting a platform material
  *   read as a matte blur while text keeps full contrast. macOS rides
@@ -142,11 +143,30 @@ const DEFAULT_VALUES: Record<'mac' | 'windows', Record<Appearance, TranslucencyV
 }
 
 /**
- * The untouched values for an appearance on this platform. Linux never reaches
- * here — translucency is unsupported there, so nothing resolves.
+ * The untouched values for an appearance on this platform.
+ *
+ * These are GLASS defaults — the tint a frosted sidebar starts at. Clear mode
+ * shares the lever but not its meaning (see `clearModeDefault`), so callers
+ * must not hand these straight to a clear-mode state.
  */
 export function defaultTranslucencyValues(appearance: Appearance, isWindows: boolean): TranslucencyValues {
   return DEFAULT_VALUES[isWindows ? 'windows' : 'mac'][appearance]
+}
+
+/**
+ * Clear mode's own default: off.
+ *
+ * The two modes share one 0–100 lever but not one meaning — under glass
+ * `intensity` is the tint the renderer keeps; under clear it IS the native
+ * window opacity. So a glass default must never stand in for a clear one: 29
+ * reads as a 29% tint over a frosted sidebar, and as `opacityRamp(29) = 0.94113`
+ * on the whole window, text included. Every platform that cannot back glass
+ * (Linux, Windows 10) resolves `mode: 'clear'`, and the sidebar tint default
+ * leaked into a whole-window fade on both. An untouched clear-mode profile
+ * starts at 100% opaque; raising the lever is the user's own call.
+ */
+function clearModeDefault(values: TranslucencyValues, mode: TranslucencyMode): TranslucencyValues {
+  return mode === 'glass' ? values : { ...values, intensity: 0 }
 }
 
 /**
@@ -194,13 +214,17 @@ export function clampIntensity(value: unknown): number {
 }
 
 /**
- * Whether this OS can do ANY translucency. Clear rides `setOpacity`, which
- * Electron documents as doing nothing on Linux, and glass needs a native
- * material Linux does not have — so the whole setting is dead there and the
- * row should not be shown at all.
+ * Whether this OS can do ANY translucency.
+ *
+ * Clear rides `setOpacity`. Electron documented that as a no-op on Linux for
+ * years, which is why Linux was excluded — but Chromium's Ozone X11
+ * (`_NET_WM_WINDOW_OPACITY`) and Wayland backends honour it (measured on
+ * Electron 44: a Linux window really does fade). Glass still needs a native
+ * material Linux does not have, so `glassSupportedOn` keeps excluding it: Linux
+ * gets Clear and nothing else.
  */
 export function translucencySupportedOn(platform: string): boolean {
-  return platform === 'darwin' || platform === 'win32'
+  return platform === 'darwin' || platform === 'win32' || platform === 'linux'
 }
 
 /**
@@ -286,9 +310,11 @@ export function defaultTranslucencyState(
   glassSupported: boolean,
   isWindows: boolean
 ): TranslucencyState {
+  const mode = normalizeMode(undefined, glassSupported)
+
   return {
-    ...defaultTranslucencyValues(appearance, isWindows),
-    mode: normalizeMode(undefined, glassSupported)
+    ...clearModeDefault(defaultTranslucencyValues(appearance, isWindows), mode),
+    mode
   }
 }
 
@@ -352,7 +378,7 @@ export function resolveTranslucency(
   appearance: Appearance,
   isWindows: boolean
 ): TranslucencyState {
-  const fallback = defaultTranslucencyValues(appearance, isWindows)
+  const fallback = clearModeDefault(defaultTranslucencyValues(appearance, isWindows), book.mode)
   const slot = book[appearance]
 
   return {

@@ -76,9 +76,9 @@ export const GLASS_SUPPORTED =
     : isMacPlatform() || isWindowsPlatform())
 
 /**
- * Whether the setting is worth showing at all. Linux has neither half —
- * `setOpacity` is a documented no-op and there is no native material — so
- * Settings hides the row rather than offering a lever that does nothing.
+ * Whether the setting is worth showing at all. Linux has the Clear half
+ * (`setOpacity` works under Ozone) but no native material, so Settings shows
+ * the row there and `GLASS_SUPPORTED` alone hides the Glass controls.
  */
 export const TRANSLUCENCY_SUPPORTED =
   !isBrowserHostedDesktop() &&

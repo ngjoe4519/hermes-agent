@@ -790,8 +790,9 @@ export function AppearanceSettings({ subpage }: AppearanceSettingsProps = {}) {
             </div>
           )}
 
-          {/* Linux has neither half of this setting (see TRANSLUCENCY_SUPPORTED),
-              so the row is absent there rather than offering a dead lever. */}
+          {/* A platform with no translucency at all shows no row — but Linux has
+              the Clear half, and `GLASS_SUPPORTED` below is what keeps its Glass
+              controls off the same line. */}
           {show('window-layout') && TRANSLUCENCY_SUPPORTED && (
             <ListRow
               action={
