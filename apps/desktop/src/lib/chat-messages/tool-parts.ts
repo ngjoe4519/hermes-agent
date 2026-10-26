@@ -921,6 +921,20 @@ export function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex
   }
 }
 
+/**
+ * Concatenate two part lists so each tool call appears once: an earlier
+ * tool-call part is dropped when the later list carries the same id, so the
+ * fresher copy wins. Other parts concatenate unchanged. Activation uses this
+ * when it merges a cached stream row into the re-fetched one: a re-delivered
+ * `open_requests` marks the cached row changed, and a raw concat rendered the
+ * same call twice, with reasoning from between the copies.
+ */
+export function concatPartsByToolCall(earlier: ChatMessagePart[], later: ChatMessagePart[]): ChatMessagePart[] {
+  const laterIds = new Set(later.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : [])))
+
+  return [...earlier.filter(part => !(part.type === 'tool-call' && laterIds.has(part.toolCallId))), ...later]
+}
+
 export function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   return messages.map(message => {
     const seen = new Set<string>()

@@ -3,7 +3,7 @@ import { mergeUsage } from '@hermes/shared'
 import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
-import { sameAttachmentTurn, spliceOlderPreservedRows } from '@/lib/chat-messages'
+import { concatPartsByToolCall, sameAttachmentTurn, spliceOlderPreservedRows } from '@/lib/chat-messages'
 import {
   assistantTextPart,
   type ChatMessage,
@@ -1759,7 +1759,7 @@ export function overlayConcurrentMessageChanges(
 
       const replacement =
         activationText && !currentText.startsWith(activationText)
-          ? { ...current, parts: [...activationStream.parts, ...current.parts] }
+          ? { ...current, parts: concatPartsByToolCall(activationStream.parts, current.parts) }
           : current
 
       nextIndexById.delete(activationStream.id)
