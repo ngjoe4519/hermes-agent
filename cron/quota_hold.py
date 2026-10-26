@@ -133,7 +133,9 @@ def plan_hold(
         return False
     if kind == "cron" and blocked:
         # Coalesce cron occurrences inside the closed window to the first legal instant after it.
-        parked = compute_next_run(schedule, window_end.isoformat()) or window_end.isoformat()
+        parked = compute_next_run(
+            schedule, window_end.isoformat(), timezone=job.get("timezone")
+        ) or window_end.isoformat()
     else:
         parked = window_end.isoformat()
     if recover:
