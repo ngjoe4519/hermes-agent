@@ -1,6 +1,6 @@
-import type { Translations } from "./types";
+import { defineLocale } from "./define-locale";
 
-export const hu: Translations = {
+export const hu = defineLocale({
   common: {
     save: "Mentés",
     saving: "Mentés...",
@@ -784,4 +784,4 @@ export const hu: Translations = {
     logTruncated: "(az utolsó 100 KB látható — teljes napló: ",
     logAt: ")",
   },
-};
+});
