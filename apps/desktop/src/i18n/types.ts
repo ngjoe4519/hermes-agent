@@ -4066,6 +4066,7 @@ catalog: CatalogTranslations
         running: string
         ranCode: string
         runningCode: string
+        blocked: string
       }
       prefixes: {
         browser: string
