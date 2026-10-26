@@ -9,7 +9,9 @@ import {
   loadAgentPlugins
 } from '@/store/agent-plugins'
 import { notify } from '@/store/notifications'
+import type { AppGuidance } from '@/store/plugin-app-guidance'
 import type { PluginInstallRequest } from '@/store/plugin-install-request'
+import { scopeConnectionId } from '@/store/plugin-owner-request'
 
 export type ProbeResult = Awaited<ReturnType<NonNullable<NonNullable<Window['hermesDesktop']>['probePluginRepo']>>>
 
@@ -55,7 +57,11 @@ export interface InstallDeps {
   requestGateway: GatewayRequest
 }
 
-export type InstallOutcome = { error: string; status: 'failed' } | { status: 'done' } | { status: 'uncertain' }
+export type InstallOutcome =
+  | { error: string; status: 'failed' }
+  | { guidance: AppGuidance; status: 'app_blocked' }
+  | { status: 'done' }
+  | { status: 'uncertain' }
 
 interface Report {
   errors: string[]
@@ -185,8 +191,12 @@ export async function runPluginInstall(plan: InstallPlan, deps: InstallDeps): Pr
   const report: Report = { errors: [], successes: [] }
   const agentResult = components.agent ? await installAgentHalf(plan, deps, report) : undefined
 
+  if (agentResult?.appGuidance) {
+    return { status: 'app_blocked', guidance: agentResult.appGuidance }
+  }
+
   if (agentResult?.timedOut) {
-    void loadAgentPlugins(deps.requestGateway, plan.profile)
+    void loadAgentPlugins(deps.requestGateway, plan.profile, scopeConnectionId(plan.request.profile), { force: true })
 
     return { status: 'uncertain' }
   }
@@ -195,7 +205,7 @@ export async function runPluginInstall(plan: InstallPlan, deps: InstallDeps): Pr
     await installDesktopHalf(plan, components, deps.copy, report, agentResult)
   }
 
-  await loadAgentPlugins(deps.requestGateway, plan.profile)
+  await loadAgentPlugins(deps.requestGateway, plan.profile, scopeConnectionId(plan.request.profile), { force: true })
 
   for (const message of report.successes) {
     notify({ kind: 'success', message })

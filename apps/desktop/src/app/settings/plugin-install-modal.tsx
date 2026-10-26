@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { Puzzle } from 'lucide-react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
@@ -19,20 +19,39 @@ import {
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/i18n'
+import { ExternalLink } from '@/lib/external-link'
 import { AlertTriangle, Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { COMMIT_SHA_RE } from '@/store/agent-plugins'
+import { COMMIT_SHA_RE, type GatewayRequest } from '@/store/agent-plugins'
+import { activeGatewayConnectionId } from '@/store/gateway'
+import {
+  type AppGuidance,
+  isAppBlocked,
+  officialAppDownloadUrl,
+  presenceForCatalogPlugin
+} from '@/store/plugin-app-guidance'
 import {
   $pluginInstallRequest,
   closePluginInstallRequest,
   openPluginInstallRequest,
-  type PluginInstallRequest
+  type PluginInstallRequest,
+  queuePluginHelpDraft
 } from '@/store/plugin-install-request'
-import { $activeGatewayProfile, $profiles, $profileScope, normalizeProfileKey, profileLabel } from '@/store/profile'
+import { isRemotePluginOwner, pluginOwnerRequest, scopeConnectionId } from '@/store/plugin-owner-request'
+import {
+  $activeGatewayProfile,
+  $profiles,
+  $profileScope,
+  newSessionInAgent,
+  normalizeProfileKey,
+  profileLabel,
+  requestFreshSession,
+  selectProfile
+} from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { PluginInstallDetails } from './plugin-install-details'
-import { type InstallModalCopy, type ProbeResult, runPluginInstall } from './plugin-install-run'
+import { type InstallModalCopy, type InstallOutcome, type ProbeResult, runPluginInstall } from './plugin-install-run'
 import { usePluginProbe } from './use-plugin-probe'
 
 const CAPTION = 'text-[length:var(--conversation-caption-font-size)]'
@@ -283,18 +302,201 @@ function InstallFooter({ canInstall, failed, installing, onInstall, onRetry }: I
   )
 }
 
+function AppGuidancePanel({
+  guidance,
+  onRecheck,
+  onHelp,
+  checking,
+  helpDisabled,
+  targetLabel
+}: {
+  guidance: AppGuidance
+  onRecheck: () => void
+  onHelp: () => void
+  checking: boolean
+  /** Help closes the dialog, which must not happen while an install is in flight. */
+  helpDisabled: boolean
+  targetLabel: string
+}) {
+  const { t } = useI18n()
+  const copy = t.settings.plugins.installModal.appGuidance
+  const url = officialAppDownloadUrl(guidance)
+
+  const description = {
+    missing_app: () => copy.missing(guidance.app_title),
+    version_too_old: () =>
+      copy.oldVersion(guidance.app_title, guidance.required_version ?? '', guidance.found_version ?? ''),
+    unsupported_os: () => copy.unsupportedOs(guidance.app_title),
+    unsupported_gpu: () => copy.unsupportedGpu(guidance.app_title),
+    uncertain: () =>
+      guidance.required_version && !guidance.found_version
+        ? copy.unreadableVersion(guidance.app_title, guidance.required_version)
+        : copy.uncertain(guidance.app_title),
+    app_not_running: () => copy.notRunning(guidance.app_title),
+    available: () => '',
+    no_requirements: () => ''
+  }[guidance.reason]()
+
+  if (!description) {
+    return null
+  }
+
+  return (
+    <div
+      className={cn(
+        CAPTION,
+        'space-y-2 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-2'
+      )}
+      role="status"
+    >
+      <p>
+        {description} {copy.backendHost} {t.settings.plugins.installModal.profileLabel}: {targetLabel}.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        {url && (
+          <ExternalLink href={url} native showExternalIcon>
+            {copy.download(guidance.app_title)}
+          </ExternalLink>
+        )}
+        <Button disabled={checking} onClick={onRecheck} size="sm" variant="outline">
+          {copy.recheck}
+        </Button>
+        <Button disabled={helpDisabled} onClick={onHelp} size="sm" variant="outline">
+          {copy.askHermes}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 interface InstallViewProps {
   request: PluginInstallRequest
   installing: boolean
   onInstallingChange: (installing: boolean) => void
 }
 
+function routePluginHelpChat(request: PluginInstallRequest, targetProfile: string, activeProfile: string) {
+  const connectionId = scopeConnectionId(request.profile) || activeGatewayConnectionId()
+
+  if (connectionId) {
+    newSessionInAgent({ connectionId, profile: targetProfile })
+  } else {
+    const alreadyActive = normalizeProfileKey(activeProfile) === targetProfile
+    selectProfile(targetProfile)
+
+    if (alreadyActive) {
+      requestFreshSession()
+    }
+  }
+}
+
+function useCatalogAppCheck(requestGateway: GatewayRequest, catalogName: string | undefined, targetProfile: string) {
+  const [guidance, setGuidance] = useState<AppGuidance | null>(null)
+  const [checkingApp, setCheckingApp] = useState(Boolean(catalogName))
+  const checkIntent = useRef(0)
+
+  useEffect(() => {
+    if (!catalogName) {
+      return
+    }
+
+    // Each run retires every older check, a manual recheck included, and is the only one left to clear the flag.
+    const intent = ++checkIntent.current
+    setGuidance(null)
+    setCheckingApp(true)
+    void presenceForCatalogPlugin(requestGateway, catalogName, targetProfile).then(found => {
+      if (checkIntent.current === intent) {
+        setGuidance(found)
+        setCheckingApp(false)
+      }
+    })
+
+    const intentRef = checkIntent
+
+    return () => {
+      intentRef.current++
+    }
+  }, [catalogName, requestGateway, targetProfile])
+
+  const recheckApp = async (): Promise<AppGuidance | null> => {
+    if (!catalogName) {
+      return null
+    }
+
+    const intent = ++checkIntent.current
+    setCheckingApp(true)
+
+    try {
+      const found = await presenceForCatalogPlugin(requestGateway, catalogName, targetProfile)
+
+      if (checkIntent.current === intent) {
+        setGuidance(found)
+      }
+
+      return found
+    } finally {
+      if (checkIntent.current === intent) {
+        setCheckingApp(false)
+      }
+    }
+  }
+
+  return {
+    guidance,
+    setGuidance,
+    checkingApp,
+    recheckApp
+  }
+}
+
+function applyInstallOutcome(
+  outcome: InstallOutcome,
+  request: PluginInstallRequest,
+  navigate: (to: string) => void,
+  onUncertain: () => void,
+  onBlocked: (guidance: AppGuidance) => void,
+  onFailure: (error: string) => void
+) {
+  if (outcome.status === 'done') {
+    finishInstall(request, navigate)
+  } else if (outcome.status === 'uncertain') {
+    onUncertain()
+  } else if (outcome.status === 'app_blocked') {
+    onBlocked(outcome.guidance)
+  } else {
+    onFailure(outcome.error)
+  }
+}
+
+function canStartInstall(status: {
+  installing: boolean
+  checkingApp: boolean
+  guidance: AppGuidance | null
+  installUncertain: boolean
+  pinInvalid: boolean
+  verified: boolean
+  probe: ProbeResult | null
+}): boolean {
+  return (
+    !status.installing &&
+    !status.checkingApp &&
+    !isAppBlocked(status.guidance) &&
+    !status.installUncertain &&
+    !status.pinInvalid &&
+    (status.verified || Boolean(status.probe?.ok))
+  )
+}
+
 function InstallView({ request, installing, onInstallingChange }: InstallViewProps) {
   const { t } = useI18n()
   const m = t.settings.plugins.installModal
-  const { requestGateway } = useGatewayRequest()
+  const { requestGateway: ambientRequest } = useGatewayRequest()
+  const requestGateway = useMemo(() => pluginOwnerRequest(request.profile, ambientRequest), [request, ambientRequest])
   const navigate = useNavigate()
-  const remote = useStore($connection)?.mode === 'remote'
+  const ambientRemote = useStore($connection)?.mode === 'remote'
+
+  const remote = isRemotePluginOwner(request.profile, ambientRemote)
+
   const activeProfile = useStore($activeGatewayProfile)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
@@ -303,7 +505,11 @@ function InstallView({ request, installing, onInstallingChange }: InstallViewPro
   const { probe, start, cancel, settled } = usePluginProbe(m.probeUnavailable)
 
   const [targetProfile, setTargetProfile] = useState(() =>
-    normalizeProfileKey(request.profile || activeProfile || profileScope)
+    normalizeProfileKey(
+      request.profile && typeof request.profile === 'object'
+        ? request.profile.profile
+        : request.profile || activeProfile || profileScope
+    )
   )
 
   const [advancedOpen, setAdvancedOpen] = useState(!verified)
@@ -311,6 +517,24 @@ function InstallView({ request, installing, onInstallingChange }: InstallViewPro
   const [pinRef, setPinRef] = useState('')
   const [installError, setInstallError] = useState<null | string>(null)
   const [installUncertain, setInstallUncertain] = useState(false)
+
+  const { guidance, setGuidance, checkingApp, recheckApp } = useCatalogAppCheck(
+    requestGateway,
+    request.catalogName,
+    targetProfile
+  )
+
+  const askForHelp = () => {
+    // Closing here would bypass the dialog's no-dismiss-while-installing guard.
+    if (!guidance || installing) {
+      return
+    }
+
+    queuePluginHelpDraft(m.appGuidance.helpDraft(guidance.app_title, targetProfile))
+    routePluginHelpChat(request, targetProfile, activeProfile)
+    closePluginInstallRequest()
+    navigate(NEW_CHAT_ROUTE)
+  }
 
   useEffect(() => {
     start(request.repo)
@@ -338,18 +562,19 @@ function InstallView({ request, installing, onInstallingChange }: InstallViewPro
         return
       }
 
+      // Backend host is authoritative even when the earlier check looked available.
+      const latest = await recheckApp()
+
+      if (isAppBlocked(latest)) {
+        return
+      }
+
       const outcome = await runPluginInstall(
         { request, probe: detected, profile: targetProfile, enable, force, ref: pin || undefined, remote },
         { copy: m, navigate, requestGateway }
       )
 
-      if (outcome.status === 'done') {
-        finishInstall(request, navigate)
-      } else if (outcome.status === 'uncertain') {
-        setInstallUncertain(true)
-      } else {
-        setInstallError(outcome.error)
-      }
+      applyInstallOutcome(outcome, request, navigate, () => setInstallUncertain(true), setGuidance, setInstallError)
     } finally {
       onInstallingChange(false)
     }
@@ -364,7 +589,15 @@ function InstallView({ request, installing, onInstallingChange }: InstallViewPro
   }
 
   // An unverified repository installs only once its contents are on screen; a reviewed pick may start at once.
-  const canInstall = !installing && !installUncertain && !pinInvalid && (verified || Boolean(probe?.ok))
+  const canInstall = canStartInstall({
+    installing,
+    checkingApp,
+    guidance,
+    installUncertain,
+    pinInvalid,
+    verified,
+    probe
+  })
 
   return (
     <>
@@ -372,6 +605,22 @@ function InstallView({ request, installing, onInstallingChange }: InstallViewPro
 
       <div className="space-y-3">
         <ProbeWarnings copy={m} probe={probe} />
+        {/* Install stays disabled until the backend answers; say why instead of waiting silently. */}
+        {checkingApp && (
+          <p aria-live="polite" className={cn(CAPTION, 'text-(--ui-text-secondary)')}>
+            {m.appGuidance.checking}
+          </p>
+        )}
+        {guidance && (
+          <AppGuidancePanel
+            checking={checkingApp || installing}
+            guidance={guidance}
+            helpDisabled={installing}
+            onHelp={askForHelp}
+            onRecheck={() => void recheckApp()}
+            targetLabel={targetLabel}
+          />
+        )}
 
         <Disclosure label={m.advanced} onToggle={() => setAdvancedOpen(open => !open)} open={advancedOpen}>
           <PluginInstallDetails
