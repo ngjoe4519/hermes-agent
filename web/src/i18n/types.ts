@@ -283,6 +283,8 @@ export interface Translations {
     component: string;
     lines: string;
     noLogLines: string;
+    copy: string;
+    copied: string;
   };
 
   // ── Cron page ──
