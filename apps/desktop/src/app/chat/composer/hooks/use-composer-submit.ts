@@ -17,7 +17,7 @@ import {
 } from '@/store/composer'
 import { type ComposerDraftRetry, draftRetry } from '@/store/composer-draft-retry'
 import { resetBrowseState } from '@/store/composer-input-history'
-import { enqueueQueuedPrompt, type QueuedPromptEntry, serverOwnsComposerQueue } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, serverOwnsComposerQueue } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
@@ -41,7 +41,6 @@ interface UseComposerSubmitArgs {
   disabled: boolean
   draftScopeRef: RefObject<string | null>
   draftRef: RefObject<string>
-  drainNextQueued: () => Promise<boolean>
   editorRef: RefObject<HTMLDivElement | null>
   exitQueuedEdit: (action: 'cancel' | 'save') => boolean
   focusInput: () => void
@@ -53,7 +52,6 @@ interface UseComposerSubmitArgs {
   onSubmit: ChatBarProps['onSubmit']
   queueCurrentDraft: () => boolean | Promise<boolean>
   queueEdit: QueueEditState | null
-  queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
   setComposerText: (value: string) => void
   stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
@@ -65,7 +63,7 @@ interface UseComposerSubmitArgs {
 /**
  * The composer's submit engine — the orchestration seam where the draft and
  * queue meet. `submitDraft` is the one decision tree (queue-edit save · slash-
- * now-while-busy · queue · drain · send · stop); `dispatchSubmit` is the shared
+ * now-while-busy · queue · send · stop); `dispatchSubmit` is the shared
  * send-with-restore primitive (re-loads + re-stashes the draft if the gateway
  * rejects, so nothing is ever lost); `steerDraft` redirects the live turn. Reads
  * the draft + queue APIs; owns no state of its own beyond the stable
@@ -81,7 +79,6 @@ export function useComposerSubmit({
   disabled,
   draftScopeRef,
   draftRef,
-  drainNextQueued,
   editorRef,
   exitQueuedEdit,
   focusInput,
@@ -93,7 +90,6 @@ export function useComposerSubmit({
   onSubmit,
   queueCurrentDraft,
   queueEdit,
-  queuedPrompts,
   sessionId,
   setComposerText,
   stashAt,
@@ -205,9 +201,14 @@ export function useComposerSubmit({
 
           const queueKey = activeQueueSessionKeyRef.current
 
-          // External requests contain only text; the unsent draft and its attachments stay in the composer.
+          // External fallback is not an explicit user Queue/Resume gesture.
+          // Preserve a pending one-shot Send now and an existing park.
           const enqueue = () =>
-            void enqueueQueuedPrompt(queueKey, { text, attachments: [], ...(displayKind ? { displayKind } : {}) })
+            void enqueueQueuedPrompt(
+              queueKey,
+              { text, attachments: [], ...(displayKind ? { displayKind } : {}) },
+              { resumeQueue: false }
+            )
 
           // A hidden note never becomes a user turn: it rides session.steer into
           // the model's next tool result, and keeps its kind if it has to queue.
@@ -448,8 +449,6 @@ export function useComposerSubmit({
       if (!submitWhileBusy(text, payloadPresent, blockingPrompt)) {
         return
       }
-    } else if (!payloadPresent && queuedPrompts.length > 0) {
-      void drainNextQueued()
     } else if (payloadPresent) {
       const submittedAttachments = cloneAttachments(attachments)
       const retry = takeDraftRetry?.(text, submittedAttachments)
