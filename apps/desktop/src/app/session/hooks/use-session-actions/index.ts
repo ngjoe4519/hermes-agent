@@ -138,7 +138,6 @@ import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } 
 import { isWatchWindow } from '@/store/windows'
 import type {
   SessionCreateResponse,
-  SessionMessage,
   SessionMessagesResponse,
   SessionResumeResult,
   UsageStats
@@ -172,6 +171,13 @@ import {
   rememberResolvedResumeOwner,
   resolveResumeOwner
 } from './resume-owner'
+import {
+  livePromptStreamId,
+  liveTurnSettledDuringResume,
+  reconcileAuthoritativeChatMessages,
+  reconcileAuthoritativeMessages,
+  resumedStreamTarget
+} from './resume-reconcile'
 import { backgroundRuntimeOptions, runtimeOwner } from './runtime-owner'
 import { createGatewaySession, desktopSessionCreateParams } from './session-create-request'
 import {
@@ -195,7 +201,6 @@ import {
   patchSessionWorkspace,
   preserveEquivalentTranscript,
   preserveLocalPendingTurnMessages,
-  reconcileDurableHistory,
   removeRepresentedLocalLiveProjection,
   resolveResumedBusy,
   resolveSessionProfile,
@@ -261,39 +266,6 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
   setCurrentUsage(current => ({ ...current, input, output, total: input + output }))
 }
 
-function reconcileAuthoritativeChatMessages(
-  authoritativeMessages: ChatMessage[],
-  previousMessages: ChatMessage[],
-  liveProjection?: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'>,
-  sourceRows?: SessionMessage[]
-): ChatMessage[] {
-  if (liveProjection && sourceRows) {
-    const reconciled = reconcilePersistedLiveTurn(authoritativeMessages, previousMessages, sourceRows, liveProjection)
-
-    if (reconciled) {
-      return reconciled
-    }
-  }
-
-  return reconcileDurableHistory(
-    liveProjection ? appendLiveSessionProjection(authoritativeMessages, liveProjection) : authoritativeMessages,
-    previousMessages
-  )
-}
-
-function reconcileAuthoritativeMessages(
-  authoritativeMessages: SessionResumeResult['messages'],
-  previousMessages: ChatMessage[],
-  liveProjection?: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'>
-): ChatMessage[] {
-  return reconcileAuthoritativeChatMessages(
-    toChatMessages(authoritativeMessages),
-    previousMessages,
-    liveProjection,
-    authoritativeMessages
-  )
-}
-
 interface FreshSessionDraftOptions {
   preserveRoute?: boolean
   replaceRoute?: boolean
@@ -332,15 +304,6 @@ function withoutEarlyClarifyProjection(messages: ChatMessage[], requestId: strin
   }
 
   return changed ? next : messages
-}
-
-/** Session-state patch for a restored blocking prompt row; the first non-null projection is used. */
-function livePromptStreamId(
-  ...projections: ({ streamId: string } | null)[]
-): { awaitingResponse: false; sawAssistantPayload: true; streamId: string } | Record<string, never> {
-  const live = projections.find(Boolean)
-
-  return live ? { awaitingResponse: false, sawAssistantPayload: true, streamId: live.streamId } : {}
 }
 
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
@@ -2160,7 +2123,11 @@ export function useSessionActions({
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
 
         const preferredMessages = (() => {
-          if (options?.authoritativeSnapshot && resumed.messages.length === 0 && !hasLiveProjection) {
+          // A reply the live stream settled during the RPC is newer than this snapshot (resume-settled-turn.ts).
+          if (
+            (options?.authoritativeSnapshot && resumed.messages.length === 0 && !hasLiveProjection) ||
+            liveTurnSettledDuringResume(resumed, resumeStartedAt, resumedSameSelectedSession)
+          ) {
             return currentMessages
           }
 
@@ -2395,7 +2362,14 @@ export function useSessionActions({
             ...livePromptStreamId(pendingConnectionProjection, pendingClarifyProjection),
             ...(clearedClarifyProjection
               ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  streamId: resumedRunning
+                    ? resumedStreamTarget(visibleMessagesForView, resumed.session_id, [
+                        clearedClarifyProjection.streamId,
+                        pendingConnectionProjection?.streamId,
+                        state.streamId,
+                        inFlightRecovery.streamId
+                      ])
+                    : null
                 }
               : {})
           }),
