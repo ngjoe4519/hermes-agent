@@ -39,7 +39,16 @@ class AssembledRequest:
 
 def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original_user_message: Any) -> None:
     """Run the MoA reference models and append their aggregated context to the last user
-    message (as a trailing text part on multimodal turns). Fail-open."""
+    message (as a trailing text part on multimodal turns).
+
+    Fail-open for ordinary/unmanaged MoA failures (routing/transport noise must never break the
+    surrounding turn). NOT fail-open for a REQUIRED managed slot's denial
+    (``agent.moa_model_routing.MoARequiredSlotDenied``): design §6 "MoA" is explicit that a
+    denied required reference/aggregator must leave the review gate incomplete, never complete
+    silently as if aggregation had succeeded — so that exception is re-raised here, not logged
+    and swallowed."""
+    from agent.moa_model_routing import MoARequiredSlotDenied
+
     try:
         from agent.message_content import flatten_message_text as _flatten_mt
         from agent.moa_loop import _preset_temperature, aggregate_moa_context
@@ -79,6 +88,8 @@ def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original
                 elif isinstance(_base, list):
                     _msg["content"] = [*_base, {"type": "text", "text": "\n\n" + _moa_context}]
                 break
+    except MoARequiredSlotDenied:
+        raise
     except Exception as _moa_exc:
         logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
@@ -204,6 +215,11 @@ def assemble_api_request(
     # the canonical tool registry stays undecorated. Marked ``content`` becomes text
     # blocks the whitespace pass skips, so the same row's bytes vary across turns.
     tools_for_api = agent.tools
+    if getattr(agent, "_managed_routing_receipt_id", None):
+        from agent.managed_route_budget import enforce_input_budget
+
+        enforce_input_budget(agent._managed_routing_home, agent._managed_routing_receipt_id,
+                             api_messages, tools_for_api)
     if agent._use_prompt_caching and agent.provider != "moa":
         from agent.prompt_caching import envelope_tool_part_cache_markers_supported
 

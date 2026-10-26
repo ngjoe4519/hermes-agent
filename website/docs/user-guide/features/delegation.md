@@ -263,7 +263,7 @@ A process that finishes while the child is still running needs no handoff: the c
 
 ## Model Override
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+For unmanaged delegation (including observational shadow mode), you can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models. [Enforced guided routing](#guided-model-routing-opt-in-per-task) instead selects each child's qualified route independently, without using price to lower quality.
 
 ```yaml
 # In ~/.hermes/config.yaml
@@ -272,7 +272,7 @@ delegation:
   provider: "openrouter"              # Optional: route subagents to a different provider
 ```
 
-If omitted, subagents use the same model as the parent.
+If omitted, unmanaged subagents use the same model as the parent.
 
 In Desktop, set the same keys under **Settings → Model → Subagents** (see [Desktop](../desktop.md#subagent-models-and-limits)). The page edits the profile chosen under **Applies to**, affects subagents launched after you click **Apply**, and never changes the main model or a child that is already running.
 
@@ -285,13 +285,13 @@ Decomposing a problem into well-specified subtasks takes frontier-level judgment
 model:
   default: "your-frontier-model"     # parent (planner) stays on the frontier model
 delegation:
-  model: "your-inexpensive-model"    # all delegate_task children run on this
+  model: "your-inexpensive-model"    # unmanaged children use this pin
   provider: "openrouter"             # optional: route children to a different provider
 ```
 
-Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
+Unmanaged resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Note that the pin is global: with the default strategy `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session, use a delegation strategy plugin (below), or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+This pin is global for unmanaged and shadow children. The model-facing `delegate_task` schema has no raw per-task model/provider override; managed tasks instead supply bounded `routing_requirements`, and the approved policy selects a qualified route for each member. For quality-sensitive subtasks, use [guided routing](#guided-model-routing-opt-in-per-task), leave the unmanaged pin unset to inherit the parent, use a delegation strategy plugin (below), or hand the task to the [kanban board](kanban.md#per-task-model-override). A global cost-oriented pin is not a quality qualification.
 
 ### Delegation strategies (`delegation.backend`)
 
@@ -723,7 +723,7 @@ delegation:
   api_key: "local-key"
   # api_mode: "anthropic_messages"  # Optional. Wire protocol override for base_url ("chat_completions", "codex_responses", or "anthropic_messages"). Empty = auto-detect from URL (e.g. /anthropic suffix). Set explicitly for endpoints the heuristic can't classify (Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM proxies, …).
 
-# Send per-child request settings on every subagent API call — e.g. OpenRouter
+# Send per-child request settings on unmanaged/shadow subagent API calls — e.g. OpenRouter
 # routing hints when delegating straight to openrouter.ai via base_url:
 delegation:
   model: "deepseek/deepseek-v4-flash-0731"
@@ -739,8 +739,52 @@ When `base_url` points at an Anthropic-compatible endpoint — for example a pat
 
 Subagents compact where their parent does: at `compression.threshold` × window (0.50 by default), or the global `compression.threshold_tokens` cap when one is set and lower. `delegation.compression_threshold_tokens` (default `0`, off) adds an optional absolute cap on a child's compaction *trigger*, applied as the lower of it and the ratio threshold; it never touches the request payload or the parent. A token count of at least 16000 enables it; `true` or `"200k"` are config errors that are warned and ignored. It stays off by default because a replay of a 1,393-agent run put 200K–400K caps within 5% of each other in cost once cache prefixes are intact, and every compaction is a chance to lose detail.
 
-`delegation.request_overrides` works on **all three** resolution branches — direct `base_url`, named `provider`, and pure inherit — so it always takes effect. Top-level keys are API kwargs (e.g. `service_tier`); an `extra_body` sub-dict is merged into the request's `extra_body`. Explicit values merge **over** runtime- or parent-derived overrides: explicit top-level keys win, and `extra_body` is deep-merged one level, so a provider's own request personality (e.g. `thinking: {type: disabled}`) survives unless your key redefines it. See [Configuration → Delegation](../configuration.md#delegation) for details.
+For unmanaged and observational-shadow children, `delegation.request_overrides` works on **all three** resolution branches — direct `base_url`, named `provider`, and pure inherit. Top-level keys are API kwargs (e.g. `service_tier`); an `extra_body` sub-dict is merged into the request's `extra_body`. Explicit values merge **over** runtime- or parent-derived overrides: explicit top-level keys win, and `extra_body` is deep-merged one level, so a provider's own request personality (e.g. `thinking: {type: disabled}`) survives unless your key redefines it. Enforced guided-routing children instead use the selected provider's runtime request settings, without inheriting this global delegation override bundle. Their final request must still satisfy the receipted route, reasoning and budget. See [Configuration → Delegation](../configuration.md#delegation) for details.
 
 :::tip
 The agent handles delegation automatically based on the task complexity. You don't need to explicitly ask it to delegate — it will do so when it makes sense.
 :::
+
+## Guided model routing (opt-in, per task)
+
+A delegated task's dict can carry `routing_role` (plus optional `routing_mode`,
+`routing_requirements`, and `routing_policy_id`) to have the child's actual provider/model/reasoning resolved
+by the same guided-routing selector and policy store the Kanban adapter uses, instead
+of a fixed `model`/`provider` override. A task without `routing_role` retains legacy
+behavior only when its parent is unmanaged; managed parents impose their authority
+on every nested launch.
+
+In v1, delegated children without a trusted execution-bound classification attestation
+default to deep routing. A task's proposed class is not such an attestation.
+
+- **Batch members are independent decisions.** Each task in a batch resolves its own
+  route against its own requirements; there is no single static model chosen for the
+  whole batch.
+- **Shadow mode is observation-only.** `routing_mode: "shadow"` persists the
+  recommendation (or surfaces a typed observation error) while constructing the child
+  through the unchanged legacy route. It never changes permissions, retries, fallback,
+  or outcomes. A managed parent's inherited authority always takes precedence, so a
+  nested child cannot use shadow mode to demote itself.
+- **Nested delegation inherits managed authority, it cannot escape it.** If the parent
+  agent is itself running under a receipted managed route, any further child it
+  delegates inherits that same authority ceiling — it cannot clear managed status by
+  omitting `routing_role` on the sub-task, and it cannot request a different
+  `routing_policy_id`/broader role than the one it was itself authorized under. This
+  closes the "silent escape through parent inheritance" path the design calls out.
+- **`routing_role`/`routing_mode`/`routing_requirements`/`routing_policy_id` are structured,
+  operator/caller-supplied inputs**, mirroring the Kanban `--routing-role`/
+  `--routing-requirements` CLI contract — free-text task content cannot invent
+  admission into the roster; the selector call is the only place a route is chosen.
+- **The receipted route is validated before the child sends any content**, the same
+  managed-route guard used by Kanban and MoA; a mismatch blocks the child rather than
+  silently falling back to an inherited/global model.
+
+See [Kanban worker lanes → Guided model routing](./kanban-worker-lanes.md#guided-model-routing-opt-in-per-task)
+for the `hermes kanban routing` commands that manage the shared policy this resolves
+against. The public [Subagent lifecycle API](../../developer-guide/subagent-lifecycle-api.md#guided-model-routing)
+exposes the same routing fields and uses the host-owned delegated-child constructor.
+Positive input and output/tool-growth reserve estimates are required; omitted or
+zero estimates block with `missing_input_estimate`, not an assumed empty prompt.
+The assembled prompt/context/tools are checked again before transmission. Enabling
+a policy does not grant access to another profile's credentials or prove remote
+model availability.

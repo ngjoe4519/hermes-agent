@@ -225,6 +225,7 @@ def _build_child_agent(
     routing_cfg: Optional[dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    managed_resolution: Optional[Dict[str, Any]] = None,
     # Per-task route from the delegation provider (tools/delegate_tool_routes.py): a reasoning
     # effort that beats delegation.reasoning_effort, and the profile home the child runs as.
     override_reasoning_effort: Any = None,
@@ -237,6 +238,10 @@ def _build_child_agent(
     import uuid as _uuid
     from run_agent import AIAgent
     from agent.delegation_context import delegated_child_context
+    from tools.delegate_tool_routing import _parent_managed_context
+    if managed_resolution is None and _parent_managed_context(parent_agent)[1] is not None:
+        from agent.model_selection_types import RoutingBlocked
+        raise RoutingBlocked("unsupported_executor", "managed direct construction requires routed launch; use delegation or SubagentLifecycleService with input estimates")
     from tools.delegate_tool_routes import delegated_profile_scope
     # Role is depth-derived: a child may delegate iff the kill switch is on and
     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
@@ -280,6 +285,10 @@ def _build_child_agent(
         )
         if override_service_tier:
             rt["service_tier"] = override_service_tier
+        if managed_resolution is not None and managed_resolution.get("routing_mode") != "shadow":
+            # A managed child never escapes its receipted route through an inherited
+            # fallback chain (design §5/§12): clear the chain the runtime resolved.
+            rt["fallback_model"] = []
         if override_request_overrides is not None:
             # honored whenever set, incl. the inherit branch where
             # _resolve_delegation_credentials already merged OVER the parent's
@@ -450,26 +459,115 @@ def _build_children(
     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], routes: list[Any], *,
     top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
+    blocked_results: Optional[list] = None,
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe), each on its task's route;
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
+    from tools.delegate_tool_child_run import discard_unstarted_children
+    from tools.delegate_tool_routing import _task_intake
+    import uuid
+
+    # Structural rejection precedes resource acquisition; policy eligibility
+    # remains an independent per-member result.
+    for i, task in enumerate(task_list):
+        try:
+            _task_intake(task)
+        except ValueError as exc:
+            return [], f"Task {i} routing: {exc}"
+    launch_id = uuid.uuid4().hex
     children = []
     for i, t in enumerate(task_list):
         route = routes[i]
         if route.error:
             continue  # refused by its backend: no child; its result entry is the refusal
+        # Host identity cannot come from model intake or best-effort logging.
+        t = {**t, "_delegation_id": f"{launch_id}:task-{i}"}
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Guided model routing (plans/2026-09-15_141016-guided-model-routing.md §6 "Delegation"):
+        # a per-task ``routing_role`` (or an inherited managed-parent ceiling) resolves through the
+        # SAME neutral selector/store/guard Kanban uses. A resolution failure is a real spawn
+        # failure -- propagated exactly like the existing pinned-command preflight failure, never
+        # silently downgraded to an unmanaged/default route (design §5).
+        from agent.model_selection_types import RoutingBlocked as _RoutingBlocked
+        from tools.delegate_tool_routing import (
+            resolve_delegation_route, stamp_managed_route, stamp_shadow_route,
+        )
+        try:
+            _routing_resolution = resolve_delegation_route(t, parent_agent, task_index=i)
+        except _RoutingBlocked as exc:
+            if blocked_results is None:
+                discard_unstarted_children(parent_agent, children)
+                raise
+            entry = _fabricated_entry(i, "error", str(exc), None)
+            entry["routing_reason"] = exc.reason
+            blocked_results.append(entry)
+            continue
+        except ValueError as exc:
+            discard_unstarted_children(parent_agent, children)
+            return [], f"Task {i} routing: {exc}"
+        except Exception:
+            # Persistence failures are fatal, not independent policy denials.
+            # No runner owns the earlier children yet.
+            discard_unstarted_children(parent_agent, children)
+            raise
+        _task_overrides = dict(_route_overrides(route))
+        _routing_enforced = bool(
+            _routing_resolution is not None
+            and _routing_resolution.get("routing_mode", "enforced") == "enforced"
+        )
+        if _routing_enforced:
+            # Managed override: authoritative, never merged with parent/config inheritance (§5) --
+            # this REPLACES the config-derived overrides (and the provider route's reasoning /
+            # profile / tier) for this one task's construction only.
+            _task_overrides.update({
+                "override_provider": _routing_resolution["provider"],
+                "override_base_url": _routing_resolution.get("endpoint"),
+                "override_api_key": None,  # resolved provider credentials inherit via runtime resolution below
+                "override_api_mode": None,
+                "override_request_overrides": None,
+                "override_acp_command": None, "override_acp_args": None,
+                "override_reasoning_effort": None,
+                "profile_home": None,
+                "override_service_tier": None,
+            })
+            _managed_model = _routing_resolution["model"]
+            _managed_reasoning = _routing_resolution.get("reasoning_effort")
+            try:
+                from tools.delegate_tool_config import _runtime_provider_credentials
+                _managed_runtime_creds = _runtime_provider_credentials(
+                    {"model": _managed_model, "provider": _routing_resolution["provider"], "api_mode": None},
+                    None,
+                )
+            except ValueError as exc:
+                blocked = _RoutingBlocked("provider_unavailable", "managed route provider could not be resolved")
+                if blocked_results is None:
+                    discard_unstarted_children(parent_agent, children)
+                    raise blocked from exc
+                entry = _fabricated_entry(i, "error", str(blocked), None)
+                entry.update(routing_reason=blocked.reason, routing_receipt_id=_routing_resolution["receipt_id"])
+                blocked_results.append(entry)
+                continue
+            _task_overrides["override_api_key"] = _managed_runtime_creds["api_key"]
+            _task_overrides["override_api_mode"] = _managed_runtime_creds["api_mode"]
+            _task_overrides["override_request_overrides"] = _managed_runtime_creds.get("request_overrides")
+            _task_overrides["override_acp_command"] = _managed_runtime_creds.get("command")
+            _task_overrides["override_acp_args"] = _managed_runtime_creds.get("args")
+            if _routing_resolution.get("endpoint") is None:
+                _task_overrides["override_base_url"] = _managed_runtime_creds.get("base_url")
+        else:
+            _managed_model = route.creds["model"]
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=route.creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **_route_overrides(route),
+                model=_managed_model, max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                managed_resolution=_routing_resolution, **_task_overrides,
             )
         except ValueError as exc:
             # An owner refusal can land mid-batch: the siblings built so far hold reservations.
@@ -477,7 +575,24 @@ def _build_children(
                 _detach_child(parent_agent, built)
                 _close_child(built, "Failed to close child after a refused sibling")
             return [], str(exc)
-        pin_child_service_tier(child, route.creds)
+        if not _routing_enforced:
+            # A managed resolution is authoritative for this child; the provider route's
+            # tier belongs to the route creds it replaced.
+            pin_child_service_tier(child, route.creds)
+        if _routing_enforced:
+            if _routing_resolution.get("reasoning_effort"):
+                from hermes_constants import parse_reasoning_effort as _parse_reasoning_effort
+                _parsed_reasoning = _parse_reasoning_effort(_routing_resolution["reasoning_effort"])
+                if _parsed_reasoning is not None:
+                    child.reasoning_config = _parsed_reasoning
+            # Pinned runtime receipt (design §4 step 7, §12): the SAME per-request guard every
+            # managed agent carries (agent.managed_route_guard.enforce_managed_route_per_request)
+            # re-validates this child's actually-constructed route against this receipt before
+            # EVERY request in its own turn, not merely at construction -- catching a fallback/
+            # rotation that silently swapped the client mid-turn.
+            stamp_managed_route(child, _routing_resolution)
+        elif _routing_resolution is not None:
+            stamp_shadow_route(child, _routing_resolution)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -650,16 +765,18 @@ def delegate_task(
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
+    blocked_results = []
     children, err = _build_children(
         task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        blocked_results=blocked_results,
     )
     if err:
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
-        live_home=_live_home, refused=refused,
+        blocked_results=blocked_results, live_home=_live_home, refused=refused,
     )
     return _run_batch(batch, background)
 
@@ -820,6 +937,27 @@ DELEGATE_TASK_SCHEMA = {
                             "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
                             "files do NOT belong here — put paths in 'context' instead.",
                             items={"type": "string"},
+                        ),
+                        "routing_role": _p(
+                            "string",
+                            "Optional approved-policy role for guided routing (for example builder or "
+                            "reviewquality). The host selects the exact route; this is never a raw provider pin.",
+                        ),
+                        "routing_mode": _p(
+                            "string",
+                            "With routing_role: enforced (default) pins the approved route; shadow records "
+                            "a recommendation while preserving the legacy child route.",
+                            enum=["enforced", "shadow"],
+                        ),
+                        "routing_requirements": _p(
+                            "object",
+                            "Structured task fit: task_class, required_capabilities, positive input_tokens "
+                            "and reserve_tokens, plus verified contributor provenance for review roles.",
+                        ),
+                        "routing_policy_id": _p(
+                            "string",
+                            "Optional approved policy id. Omit for the host default; a managed parent "
+                            "pins this value and rejects attempts to switch policy.",
                         ),
                         "group": _p(
                             "string",

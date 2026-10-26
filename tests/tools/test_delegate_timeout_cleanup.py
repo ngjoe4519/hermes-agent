@@ -37,6 +37,8 @@ class _SlowUnwindingChild:
         # Model the real child turn's finally path: it still performs session
         # activity/SQLite cleanup after the parent requests interruption.
         self.unwinding.set()
+        # Event ordering is the oracle; leave time for cold parent-side imports
+        # and result bookkeeping before the test releases this worker.
         assert self.allow_finish.wait(timeout=30)
         self.finished.set()
         return {

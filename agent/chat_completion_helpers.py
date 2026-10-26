@@ -765,6 +765,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    from agent.managed_route_wire import enforce_supported_wire
+    enforce_supported_wire(agent)
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -786,12 +788,14 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    from agent.managed_route_wire import enforce_chat_wire
+
+    enforce_chat_wire(agent, request_client, api_kwargs)
     # #93650: keep the bulk wire-format payload out of the SDK's GIL-holding
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
     return _chat_completion_capturing_headers(agent, request_client, api_kwargs)
-
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2209,7 +2213,9 @@ def _managed_summary_call(agent, api_request_id: str, request, callback, *, retr
     )
 
 
-def _summary_text(agent, response, **normalize_kwargs) -> str:
+def _summary_text(agent, response, *, observation, **normalize_kwargs) -> str:
+    from agent.managed_route_health import record_response_identity
+    record_response_identity(observation, response)
     if is_router_timeout_shim(response):
         # Router failure in a 200 envelope (#68396): an empty summary takes the retry slot.
         logger.warning("Iteration summary returned a router timeout shim; retrying")
@@ -2223,7 +2229,7 @@ def _summary_text(agent, response, **normalize_kwargs) -> str:
 
 
 def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
-    def _attempt(retry_count: int) -> str:
+    def _attempt(retry_count: int, observation) -> str:
         codex_kwargs = agent._build_api_kwargs(api_messages)
         # The transport emits these three as one block (transports/codex.py build_kwargs);
         # strict Responses backends 400 on tool_choice/parallel_tool_calls without tools.
@@ -2233,12 +2239,12 @@ def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
         # Route through the same seam as normal Codex turns: a direct _run_codex_stream
         # bypasses the stale/TTFB watchdogs, interrupt handling and client cleanup, so an
         # unattended cron summary could wedge forever (#70943).
-        return _summary_text(agent, agent._interruptible_api_call(codex_kwargs))
+        return _summary_text(agent, agent._interruptible_api_call(codex_kwargs), observation=observation)
     return _attempt
 
 
 def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
-    def _attempt(retry_count: int) -> str:
+    def _attempt(retry_count: int, observation) -> str:
         ant_kw = agent._get_transport().build_kwargs(
             model=agent.model, messages=api_messages, tools=None, max_tokens=agent.max_tokens,
             reasoning_config=agent.reasoning_config, is_oauth=agent._is_anthropic_oauth,
@@ -2246,7 +2252,7 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
         ant_kw = _merge_nous_portal_messages_extra_body(agent, ant_kw, api_messages)
         response = _managed_summary_call(
             agent, api_request_id, ant_kw, agent._interruptible_api_call, retry_count=retry_count)
-        return _summary_text(agent, response, strip_tool_prefix=agent._is_anthropic_oauth)
+        return _summary_text(agent, response, observation=observation, strip_tool_prefix=agent._is_anthropic_oauth)
     return _attempt
 
 
@@ -2263,13 +2269,13 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     if agent.provider == "moa" and _moa_client_consumes_prepared_request(agent.client):  # transport strips data_use
         summary_kwargs["_moa_prepared_request"] = agent.client.chat.completions.prepare(api_messages)
 
-    def _attempt(retry_count: int) -> str:
+    def _attempt(retry_count: int, observation) -> str:
         # Use the ordinary request-local lifecycle: a summary can be interrupted
         # during a long prefill without closing the shared primary client.
         response = _managed_summary_call(
             agent, api_request_id, summary_kwargs, agent._interruptible_api_call,
             retry_count=retry_count)
-        return _summary_text(agent, response)
+        return _summary_text(agent, response, observation=observation)
     return _attempt
 
 
@@ -2302,7 +2308,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
         final_response = _EMPTY_SUMMARY_RESPONSE
         for retry_count in (0, 1):
-            text = attempt(retry_count)
+            from agent.managed_route_health import observe_request
+            from agent.managed_route_wire import enforce_supported_wire
+
+            enforce_supported_wire(agent)
+            # Summary requests bypass the turn call owner on every protocol.
+            with observe_request(getattr(agent, "_managed_routing_home", None),
+                                 getattr(agent, "_managed_routing_receipt_id", None)) as observation:
+                text = attempt(retry_count, observation)
             if not text:
                 continue
             if "<think>" in text:
@@ -2949,6 +2962,9 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
+        from agent.managed_route_wire import enforce_chat_wire
+
+        enforce_chat_wire(self.agent, request_client, stream_kwargs)
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
@@ -3040,10 +3056,12 @@ class _StreamingCall(StreamingWaitMonitor):
         carriers = StreamCarriers()
         finish_reason = model_name = usage_obj = None
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
+        reported_identity = {}
         role = "assistant"
         _diag = self._new_diag()
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
         from agent.chat_completion_helpers_relay import RelayChatAccumulator
+        from agent.managed_route_health import record_response_identity
         relay_response = RelayChatAccumulator()
         # The raw channels, not the callback-delivered text: cron, subagents and callback-less
         # gateway turns register no stream callback, so nothing else sees a loop mid-stream.
@@ -3100,6 +3118,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 continue
             model_name, response_id, upstream_provider = self._chunk_identity(
                 _diag, chunk, model_name, response_id, upstream_provider)
+            record_response_identity(reported_identity, chunk)
             if not chunk.choices:
                 usage, finish_reason = self._choiceless_chunk(chunk, finish_reason)
                 usage_obj = usage or usage_obj
@@ -3211,6 +3230,7 @@ class _StreamingCall(StreamingWaitMonitor):
             "length" if runaway else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
             refusal_parts=refusal_parts)
+        response._hermes_reported_model = reported_identity.get("reported_model")
         carriers.apply(response)
         if runaway:
             # Cut, not finished: the length path ends the turn on this mark instead of continuing.
@@ -3399,6 +3419,9 @@ class _StreamingCall(StreamingWaitMonitor):
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
+            from agent.managed_route_wire import enforce_anthropic_wire
+
+            enforce_anthropic_wire(self.agent, request_client, final_kwargs)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return normalize_stream_usage(manager.__enter__())
@@ -3979,6 +4002,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    from agent.managed_route_wire import enforce_supported_wire
+    enforce_supported_wire(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":

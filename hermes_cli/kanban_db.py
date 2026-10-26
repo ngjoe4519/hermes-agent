@@ -637,12 +637,19 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    routing_role: Optional[str] = None       # guided-routing role requested for this task; NULL = unmanaged
+    routing_receipt_id: Optional[str] = None  # id of the resolved decision receipt in model_routing.db
+    routing_mode: Optional[str] = None       # enforced (default) | shadow; NULL when no routing role
+    routing_shadow_receipt_id: Optional[str] = None  # observational receipt; never worker authority
+    routing_requirements: Optional[dict] = None  # validated per-task intake (see kanban_model_routing)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
         g = lambda col, default=None: _lossy_text(_row_get(row, col, default))
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        requirements_parsed = _json_or(g("routing_requirements"))
+        requirements_value = requirements_parsed if isinstance(requirements_parsed, dict) else None
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: _to_epoch(g(col)) for col in _TASK_EPOCH_COLUMNS},  # outside writers may store text: epoch or None
@@ -655,6 +662,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            routing_requirements=requirements_value,
         )
 
 
@@ -669,6 +677,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "routing_role", "routing_receipt_id", "routing_mode", "routing_shadow_receipt_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1167,6 +1176,9 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    routing_role: Optional[str] = None,
+    routing_mode: Optional[str] = None,
+    routing_requirements: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1182,14 +1194,31 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``routing_role``: opts this task into guided model routing (design
+    plans/2026-09-15_141016-guided-model-routing.md). Resolved to a receipted
+    decision at claim/start time, not here — a queued task must see current
+    policy/availability, not a stale snapshot from creation time.
+    ``routing_requirements``: genuine per-task requirements intake (design §3.B):
+    an optional dict with any of ``task_class``, ``required_capabilities``,
+    ``input_tokens``, ``reserve_tokens``, ``provenance`` (contributor makers +
+    frozen_sha for independent-review tasks). Validated up front (schema/type/
+    enum) via ``hermes_cli.kanban_model_routing.validate_routing_requirements``
+    so a malformed intake fails at creation, not silently at claim time.
+    Omitted fields are NOT fabricated here: ``resolve_task_route`` applies the
+    documented conservative defaults (unclassified scope -> deep quality floor)
+    at claim time, never a fixed placeholder shape.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_model_routing import normalize_routing_mode, validate_routing_requirements
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    routing_requirements = validate_routing_requirements(routing_requirements)
+    routing_role = str(routing_role).strip() if routing_role else None
+    routing_mode = normalize_routing_mode(routing_mode, has_role=bool(routing_role))
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1266,8 +1295,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        routing_role, routing_mode, routing_requirements
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1277,6 +1307,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        routing_role, routing_mode,
+                        json.dumps(routing_requirements) if routing_requirements is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -1496,6 +1528,79 @@ def set_model_override(
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
     )
+
+
+def set_routing_receipt(
+    conn: sqlite3.Connection, task_id: str, receipt_id: Optional[str], *,
+    expected_run_id: int,
+) -> bool:
+    """Record the guided-routing decision receipt id resolved for this task's
+    current attempt (design plans/2026-09-15_141016-guided-model-routing.md
+    §12 claim/start sequence). Called by the dispatcher immediately after a
+    successful ``select()`` for a ``routing_role`` task, before spawning the
+    worker — never at card-creation time.
+
+    ``expected_run_id`` is a MANDATORY compare-and-set guard against the run
+    the caller claimed: a decision resolved under a run that a concurrent
+    reclaim/replace has since superseded (``current_run_id`` moved on) must
+    NOT be linked to the new run — the "claim/run CAS" half of the
+    claim/start/crash contract (design §12). There is no unguarded fallback:
+    a receipt can only ever be attached to a genuine, still-current, live
+    claim — never persisted "blind" against whatever run happens to be
+    current at write time. Returns False (never raises) when the CAS misses
+    (including when ``expected_run_id`` is falsy — no live run to bind to),
+    so the caller treats it as a lost claim, not a schema/persistence error."""
+    if not expected_run_id:
+        # No live run to bind this receipt to (never claimed / already
+        # cleared) — refuse rather than attach it unconditionally to
+        # whatever the task's current_run_id happens to be.
+        return False
+    with write_txn(conn):
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status == "archived":
+            raise RuntimeError("cannot set routing receipt on archived task")
+        cur = conn.execute(
+            "UPDATE tasks SET routing_receipt_id = ? WHERE id = ? AND current_run_id = ?",
+            (receipt_id, task_id, expected_run_id),
+        )
+        if cur.rowcount == 0:
+            # The claim this decision was resolved under is no longer the
+            # current run (reclaimed/replaced concurrently) — link nothing.
+            return False
+        _append_event(
+            conn, task_id, "routing_receipt_set", {"receipt_id": receipt_id},
+            run_id=expected_run_id,
+        )
+    notify_task_updated(conn, task_id, ("routing_receipt_id",))
+    return True
+
+
+def set_routing_shadow_receipt(
+    conn: sqlite3.Connection, task_id: str, receipt_id: Optional[str], *, expected_run_id: int,
+) -> bool:
+    """CAS-link an observational receipt without granting worker authority."""
+    if not expected_run_id:
+        return False
+    with write_txn(conn):
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status == "archived":
+            raise RuntimeError("cannot set routing shadow receipt on archived task")
+        cur = conn.execute(
+            "UPDATE tasks SET routing_shadow_receipt_id = ? WHERE id = ? AND current_run_id = ?",
+            (receipt_id, task_id, expected_run_id),
+        )
+        if cur.rowcount == 0:
+            return False
+        _append_event(
+            conn, task_id, "routing_shadow_selected", {"receipt_id": receipt_id},
+            run_id=expected_run_id,
+        )
+    notify_task_updated(conn, task_id, ("routing_shadow_receipt_id",))
+    return True
 
 
 def _set_task_override(
@@ -1856,9 +1961,19 @@ def _append_event(
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
+
+    ``expected_run_id``, when given, is a CAS guard: the caller is reporting
+    on a SPECIFIC prior attempt (e.g. a spawn-failure/timeout/crash handler
+    that read the run id earlier, before its own possibly-slow bookkeeping).
+    If a concurrent reclaim/replace has since installed a NEWER run as
+    ``current_run_id``, this must be a no-op — a stale handler ending "the
+    current run" must never end/clobber a successor run it never owned.
+    Returns None (not the successor's id) when the CAS misses, exactly like
+    "no run was active", so callers can't mistake it for success.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -1867,6 +1982,10 @@ def _end_run(
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
+        return None
+    if expected_run_id is not None and run_id != expected_run_id:
+        # The current run is a successor to the one this caller is reporting
+        # on — never touch it.
         return None
     conn.execute(
         """
@@ -1883,7 +2002,10 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
+    )
     return run_id
 
 

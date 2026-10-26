@@ -1497,22 +1497,32 @@ class _CodexCompletionsAdapter:
             service_tier = extra_body.get("service_tier")
             if isinstance(service_tier, str) and service_tier.strip() and not is_xai:
                 resp_kwargs["service_tier"] = service_tier.strip()
-            reasoning_cfg = extra_body.get("reasoning")
-            if isinstance(reasoning_cfg, dict):
-                # Shared per-model vocabulary with the main transport ("max" only where the model publishes it; "minimal"/"ultra"
-                # clamp to a listed level; ``()`` = the model takes no ``reasoning`` field at all — gpt-4o/4.1 on api.openai.com,
-                # #76255). ``enabled: False`` goes on the wire as ``effort: none`` where the vocabulary has it,
-                # since an omitted field leaves the model's default effort on (#75227).
-                from agent.reasoning_effort import clamp_effort
-                from agent.transports.codex import _codex_efforts_for_route
-                supported = _codex_efforts_for_route(model, host, is_codex_backend=route.is_codex_backend)
-                if supported and reasoning_cfg.get("enabled") is not False:
-                    # Truthy-only: Codex 400s on e.g. {"effort": null}, so falsy → default.
-                    effort = clamp_effort(reasoning_cfg.get("effort") or "medium", supported)
-                    resp_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
-                    resp_kwargs["include"] = ["reasoning.encrypted_content"]
-                elif "none" in supported and not is_xai:
-                    resp_kwargs["reasoning"] = {"effort": "none"}
+        # Reasoning priority: explicit per-call ``_reasoning_config`` (managed MoA per-slot) wins
+        # over ``extra_body.reasoning`` — anthropic-shim parity. The caller's nested copy is
+        # consumed by ``_build_call_kwargs`` (#114020) and reasoning-handling profiles project
+        # top-level ``reasoning_effort`` instead (#75089), so the private kwarg is this shim's
+        # only reasoning source on runtime-declared Responses routes; translated below, never
+        # forwarded raw.
+        reasoning_cfg = kwargs.get("_reasoning_config")
+        if reasoning_cfg is None:
+            _rc = extra_body.get("reasoning") if isinstance(extra_body, dict) else None
+            if isinstance(_rc, dict):
+                reasoning_cfg = _rc
+        if isinstance(reasoning_cfg, dict):
+            # Shared per-model vocabulary with the main transport ("max" only where the model publishes it; "minimal"/"ultra"
+            # clamp to a listed level; ``()`` = the model takes no ``reasoning`` field at all — gpt-4o/4.1 on api.openai.com,
+            # #76255). ``enabled: False`` goes on the wire as ``effort: none`` where the vocabulary has it,
+            # since an omitted field leaves the model's default effort on (#75227).
+            from agent.reasoning_effort import clamp_effort
+            from agent.transports.codex import _codex_efforts_for_route
+            supported = _codex_efforts_for_route(model, host, is_codex_backend=route.is_codex_backend)
+            if supported and reasoning_cfg.get("enabled") is not False:
+                # Truthy-only: Codex 400s on e.g. {"effort": null}, so falsy → default.
+                effort = clamp_effort(reasoning_cfg.get("effort") or "medium", supported)
+                resp_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
+                resp_kwargs["include"] = ["reasoning.encrypted_content"]
+            elif "none" in supported and not is_xai:
+                resp_kwargs["reasoning"] = {"effort": "none"}
         if wire_tools:
             resp_kwargs["tools"] = wire_tools
         if wire_aliases:
@@ -1572,6 +1582,8 @@ class _CodexCompletionsAdapter:
             from agent.sdk_transform_bypass import bypass_sdk_request_transform
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
             stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
+            from agent.managed_route_aux_wire import enforce_aux_native_wire
+            enforce_aux_native_wire(self._client, stream_kwargs, "codex_responses")
             event_stream = self._client.responses.create(**stream_kwargs)
             guard.adopt_stream(event_stream)
             # The timer may fire while responses.create() is blocked; if the cancelled attempt
@@ -1613,7 +1625,8 @@ class _CodexCompletionsAdapter:
             tool_calls=tool_calls_raw or None,
         )
         choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        return SimpleNamespace(choices=[choice], model=model, usage=usage,
+                               _hermes_reported_model=getattr(final, "_hermes_reported_model", getattr(final, "model", None)))
 
 
 class _ChatShim:
@@ -1785,6 +1798,7 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
+        from agent.managed_route_aux_wire import enforce_aux_native_wire
         response = create_anthropic_message(
             self._client,
             anthropic_kwargs,
@@ -1792,6 +1806,7 @@ class _AnthropicCompletionsAdapter:
             # substantive payloads so keepalives can't hold a stalled summary open. None keeps
             # the fast get_final_message path.
             on_stream_event=(_anthropic_aux_stream_event_hook() if _aux_progress_active() else None),
+            before_send=lambda payload: enforce_aux_native_wire(self._client, payload, "anthropic_messages"),
         )
         _nr = get_transport("anthropic_messages").normalize_response(response, strip_tool_prefix=self._is_oauth)
         usage = None
@@ -1808,7 +1823,8 @@ class _AnthropicCompletionsAdapter:
             message=SimpleNamespace(content=_nr.content, tool_calls=_nr.tool_calls, reasoning=_nr.reasoning),
             finish_reason=_nr.finish_reason,
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        return SimpleNamespace(choices=[choice], model=model, usage=usage,
+                               _hermes_reported_model=getattr(response, "model", None))
 
 
 class AnthropicAuxiliaryClient:
@@ -1838,6 +1854,8 @@ class _BedrockCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        from agent.managed_route_aux_wire import enforce_aux_native_wire
+        enforce_aux_native_wire(self, kwargs, "bedrock_converse")
         from agent.bedrock_adapter import call_converse
         model = kwargs.get("model", self._model)
         max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
@@ -2703,15 +2721,21 @@ def _relay_sync_stream(
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
     create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    def send(request):
+        from agent.managed_route_aux_wire import enforce_aux_chat_wire
+        enforce_aux_chat_wire(client, request)
+        return create(request)
+
     if route is None:
-        return create(kwargs)
+        return send(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
     from agent.auxiliary_hooks import run_with_aux_hooks
     model_name = str(kwargs.get("model") or fallback_model)
     return run_with_aux_hooks(
         lambda: relay_llm.stream_current(
-            kwargs, create, name=provider_name, model_name=model_name, finalizer=dict,
+            kwargs, send, name=provider_name, model_name=model_name, finalizer=dict,
             metadata=relay_chat_metadata(metadata), completed_response_predicate=lambda value: hasattr(value, "choices"),
         ),
         aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
@@ -3778,7 +3802,7 @@ def _prepare_same_provider_retry(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
+        base_url=retry_base or resolved_base_url, task=task, api_mode=resolved_api_mode,
     )
     # Preserve per-request attribution headers (a profile's ``request_headers``) across the rebuilt-client
     # retry: dropping them would let a recovery retry silently lose capability gating (#60293).
@@ -6713,7 +6737,7 @@ def _build_call_kwargs(
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
     extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None, task: Optional[str] = None,
-    no_progress_timeout: Optional[float] = None,
+    no_progress_timeout: Optional[float] = None, api_mode: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments.
     ``no_progress_timeout`` is a Codex-Responses-only extra (consumed by
@@ -6768,12 +6792,19 @@ def _build_call_kwargs(
     # /v1/messages. A profile declaring api_mode=anthropic_messages (commandcode-anthropic) is on
     # that wire regardless of URL shape — once it overrides build_api_kwargs_extras the generic
     # ``extra_body.reasoning`` fallback the adapter used to read is gone, so this is the adapter's
-    # only path. _wrap_transport wraps such providers on the same declaration.
+    # only path. _wrap_transport wraps such providers on the same declaration. The same holds for
+    # a wire declared by the REQUEST (``api_mode`` override / managed routing) rather than the
+    # profile: the caller's nested ``extra_body.reasoning`` is consumed above (#114020) and the
+    # profile's top-level ``reasoning_effort`` (#75089) never reaches the native conversion, so a
+    # runtime-declared anthropic_messages/codex_responses route needs the private kwarg too —
+    # both native shims translate it (``thinking`` budget / Responses ``reasoning.effort``) and
+    # strip it before the wire; plain SDK clients never see it.
     if reasoning_config and isinstance(reasoning_config, dict):
         raw_base = base_url or ""
         if (
             provider_norm == "anthropic" or projection.messages_wire or _nous_on_messages_wire(provider_norm, model)
             or _endpoint_speaks_anthropic_messages(raw_base) or _is_anthropic_compat_endpoint(provider_norm, raw_base)
+            or api_mode in ("anthropic_messages", "codex_responses")
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
     # Conversation affinity (OpenCode relay, opt-in custom-provider header) — same key as the main
@@ -7099,12 +7130,15 @@ def _create_with_progress_once(
     # reset the compression inactivity fence, or a zero-output attempt runs to the
     # total ceiling instead of idling out (#114938). Progress ticks only for
     # substantive stream payloads or a completed usable response.
+    from agent.managed_route_aux_wire import enforce_aux_chat_wire
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+        enforce_aux_chat_wire(client, kwargs)
         response = client.chat.completions.create(**kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
+    enforce_aux_chat_wire(client, stream_kwargs)
     try:
         chunks = client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
@@ -7118,6 +7152,7 @@ def _create_with_progress_once(
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
+        enforce_aux_chat_wire(client, kwargs)
         response = client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
         return response
@@ -7170,6 +7205,7 @@ class _ChatStreamAccumulator:
         self.finish_reason = self.usage = None
         self.resp_id = ""
         self.resp_model = model or ""
+        self.reported_model = None
 
     def _check_deadlines(self) -> None:
         """Raise TimeoutError past the total ceiling or the host deadline; a host hard cancel (/stop, session
@@ -7234,6 +7270,9 @@ class _ChatStreamAccumulator:
         self._check_deadlines()
         self.resp_id = getattr(chunk, "id", None) or self.resp_id
         self.resp_model = getattr(chunk, "model", None) or self.resp_model
+        reported = getattr(chunk, "_hermes_reported_model", getattr(chunk, "model", None))
+        if isinstance(reported, str):
+            self.reported_model = reported
         chunk_usage = getattr(chunk, "usage", None)
         if chunk_usage:
             self.usage = chunk_usage
@@ -7287,7 +7326,7 @@ class _ChatStreamAccumulator:
         )
         choice = SimpleNamespace(index=0, message=message, finish_reason=self.finish_reason or "stop")
         return SimpleNamespace(id=self.resp_id, model=self.resp_model, object="chat.completion",
-                               choices=[choice], usage=self.usage)
+                               choices=[choice], usage=self.usage, _hermes_reported_model=self.reported_model)
 
 
 async def _aggregate_chat_stream_async(
@@ -7498,7 +7537,7 @@ def _prepare_aux_request(
         request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
+        no_progress_timeout=no_progress_timeout, api_mode=resolved_api_mode)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)

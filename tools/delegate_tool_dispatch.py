@@ -49,6 +49,7 @@ class _Batch:
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
+    blocked_results: list = field(default_factory=list)
     live_home: Any = None  # explicit profile home for transcripts/manifest (#91996); None = ambient resolve
     # Result entries of tasks their backend refused (no child): joined into a sync result, listed in a background
     # call's dispatch payload. Units carved for async dispatch never carry them.
@@ -197,6 +198,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     else:
         _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
 
+    results.extend(batch.blocked_results)
+    results.sort(key=lambda entry: entry["task_index"])
     _finalize_child_results(results, batch.task_list, batch.children, batch.parent_agent)
     total_duration = round(time.monotonic() - batch.overall_start, 2)
     for entry in results:
@@ -213,6 +216,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
     combined: dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
+    if not batch.children and batch.blocked_results:
+        combined["error"] = "All delegation members were blocked by routing"
     # Runtime truth about children's background processes, as prose the parent can't miss inside the JSON.
     from tools.process_registry_notifications import _process_accounting_lines
     process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
@@ -357,7 +362,9 @@ _BACKGROUND_NOTES = {
 
 def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
     """Model-facing handle for an accepted background call: one entry per async unit."""
-    goals = [t["goal"] for t in batch.task_list]
+    # Running members only: a routing-denied or refused member never runs, so the handle
+    # lists it under its typed outcome (``results``/``refused``), never as a running goal.
+    goals = [t["goal"] for _, t, _ in batch.children]
     n = len(batch.children)  # running children; refused tasks are listed under "refused"
     payload = {
         "status": "dispatched", "mode": "background", "count": n,
@@ -450,7 +457,9 @@ def _dispatch_background(batch: _Batch) -> str:
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
     )
 
-    units = [replace(unit, refused=[]) for unit in _units_of(batch)]
+    # Denied members have no child lifetime. Return their typed outcomes now,
+    # rather than duplicating them in each independently completing unit.
+    units = [replace(unit, refused=[]) for unit in _units_of(replace(batch, blocked_results=[]))]
     dispatched: list[tuple[_Batch, str]] = []
     inline_results: list[dict] = []
     slot_key: Optional[str] = None
@@ -480,6 +489,8 @@ def _dispatch_background(batch: _Batch) -> str:
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
         inline_results.extend(_execute_and_aggregate(unit)["results"])
     payload = _dispatched_payload(batch, dispatched)
+    if batch.blocked_results:
+        payload["results"] = batch.blocked_results
     if inline_results:
         payload["inline_results"] = inline_results
     return json.dumps(payload, ensure_ascii=False)
@@ -490,6 +501,6 @@ def _run_batch(batch: _Batch, background: bool) -> str:
     begin_delegation_run(
         batch.task_list, subagents=len(batch.children), depth=getattr(batch.parent_agent, "_delegate_depth", 0) + 1,
     )
-    if background:
+    if background and batch.children:
         return _dispatch_background(batch)
     return json.dumps(_execute_and_aggregate(batch), ensure_ascii=False)

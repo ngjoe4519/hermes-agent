@@ -40,11 +40,18 @@ from typing import Any, Mapping
 from agent.provider_base import ProviderBase
 
 #: Per-task property names core owns. A provider-declared parameter with one of these names is
-#: refused at schema-build time: plugins add parameters, they never redefine core ones, and the
-#: raw route fields (``provider``/``model``/``base_url``/``api_key``) never become model-facing.
+#: refused at schema-build time: plugins add parameters, they never redefine core ones, and
+#: the raw route fields (``provider``/``model``/``base_url``/``api_key``) never become model-facing.
+#: The ``routing_*`` names are core-owned guided-routing inputs: they are advertised by the
+#: delegate_task schema and consumed by ``tools.delegate_tool_routing``'s managed-routing
+#: overlay (before/alongside the backend route), so no backend ever needs to declare them.
+#: ``_delegation_id`` is the core-managed per-task identity ``delegate_task`` stamps itself
+#: (a caller-supplied one is host-owned and replaced, never backend-routed).
 RESERVED_TASK_PARAMETERS = frozenset({
     "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets",
     "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode",
+    "routing_role", "routing_mode", "routing_requirements", "routing_policy_id",
+    "_delegation_id",
 })
 
 #: Keys a route may carry; anything else in a provider's answer is ignored.

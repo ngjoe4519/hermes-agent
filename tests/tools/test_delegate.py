@@ -321,9 +321,7 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
-                self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
-                )
+                self.assertTrue(Path(child_db.db_path).samefile(parent_db.db_path))
             finally:
                 if child_db is not None:
                     child_db.close()
@@ -1679,6 +1677,24 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", task_props)
         self.assertNotIn("acp_args", task_props)
+
+    def test_schema_advertises_guided_routing_fields(self):
+        """Guided model routing (design §6 "Delegation"): a task may carry structured,
+        operator-supplied routing inputs; the model cannot invent admission into the roster."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("tasks", props)
+        self.assertIn("goal", task_props)
+        self.assertIn("context", task_props)
+        self.assertIn("output_schema", task_props)
+        self.assertIn("routing_role", task_props)
+        self.assertIn("routing_mode", task_props)
+        self.assertIn("routing_requirements", task_props)
+        self.assertIn("routing_policy_id", task_props)
+        # toolsets/max_iterations stay config-authoritative, never model-facing.
+        self.assertNotIn("toolsets", props)
+        self.assertNotIn("toolsets", task_props)
+        self.assertNotIn("max_iterations", props)
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".

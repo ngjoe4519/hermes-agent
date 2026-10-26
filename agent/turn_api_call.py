@@ -98,32 +98,36 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
-        if _use_streaming:
-            return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
-            )
-        from agent import relay_llm
+        from agent.managed_route_health import observe_request, record_response_identity
 
-        return relay_llm.execute(
-            next_api_kwargs,
-            agent._interruptible_api_call,
-            session_id=str(agent.session_id or ""),
-            name=str(agent.provider or "provider"),
-            model_name=str(agent.model or ""),
-            metadata={
-                "api_mode": agent.api_mode,
-                "api_request_id": api_request_id,
-                "call_role": (
-                    "delegated"
-                    if getattr(agent, "is_subagent", False)
-                    else "fallback"
-                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                    else "primary"
-                ),
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+        with observe_request(getattr(agent, "_managed_routing_home", None),
+                             getattr(agent, "_managed_routing_receipt_id", None)) as observation:
+            if _use_streaming:
+                return record_response_identity(observation, agent._interruptible_streaming_api_call(
+                    next_api_kwargs, on_first_delta=_stop_spinner
+                ))
+            from agent import relay_llm
+
+            return record_response_identity(observation, relay_llm.execute(
+                next_api_kwargs,
+                agent._interruptible_api_call,
+                session_id=str(agent.session_id or ""),
+                name=str(agent.provider or "provider"),
+                model_name=str(agent.model or ""),
+                metadata={
+                    "api_mode": agent.api_mode,
+                    "api_request_id": api_request_id,
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": retry_count,
+                },
+                defer_logical_completion=True,
+            ))
 
     from hermes_cli.middleware import run_llm_execution_middleware
 

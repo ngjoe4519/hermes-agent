@@ -59,6 +59,10 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    routing_role: Optional[str] = None
+    routing_mode: Optional[str] = None
+    routing_policy_id: Optional[str] = None
+    routing_requirements: Optional[Mapping[str, Any]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,6 +77,8 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    routing_receipt_id: Optional[str] = None
+    routing_shadow_receipt_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -293,18 +299,24 @@ class SubagentLifecycleService:
             _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
             DEFAULT_MAX_ITERATIONS,
         )
-        # Routing precedence: request.provider > delegation config > parent.
-        routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
-        try:
-            creds = _resolve_delegation_credentials(routing_cfg, parent)
-        except ValueError as exc:
-            raise SubagentLifecycleError(str(exc)) from exc
-        child = _build_child_preserving_parent_tools(
-            task_index=0, goal=request.goal, context=request.context,
-            toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
-            task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
-        )
+        from tools.delegate_tool_routing import _parent_managed_context, build_lifecycle_child
+        if request.routing_role or _parent_managed_context(parent)[1] is not None:
+            # Managed guided routing (receipt-bound child construction); a parent that
+            # carries managed authority never falls through to the unmanaged path.
+            child = build_lifecycle_child(request, parent)
+        else:
+            # Routing precedence: request.provider > delegation config > parent.
+            routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
+            try:
+                creds = _resolve_delegation_credentials(routing_cfg, parent)
+            except ValueError as exc:
+                raise SubagentLifecycleError(str(exc)) from exc
+            child = _build_child_preserving_parent_tools(
+                task_index=0, goal=request.goal, context=request.context,
+                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+                model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
+                task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
+            )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
@@ -313,6 +325,8 @@ class SubagentLifecycleService:
             PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
             getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            getattr(child, "_managed_routing_receipt_id", None),
+            getattr(child, "_shadow_routing_receipt_id", None),
         )
         record = _Record(handle, SubagentState.PENDING, created, agent=child)
         with _REGISTRY.lock:

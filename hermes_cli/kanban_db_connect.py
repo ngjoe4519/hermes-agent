@@ -887,6 +887,28 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Guided-routing (plans/2026-09-15_141016-guided-model-routing.md): persisted
+    # decision receipt id in the origin profile's model_routing.db, resolved at
+    # claim/start (not card creation) so queued tasks see current approval/
+    # availability. NULL = unmanaged task, legacy behavior unchanged.
+    ("routing_receipt_id", "routing_receipt_id TEXT"),
+    # Requested managed-routing role for this task (e.g. "builder",
+    # "reviewquality"); NULL means unmanaged. Distinct from the eventual
+    # receipt so a re-attempt can reselect against the same role.
+    ("routing_role", "routing_role TEXT"),
+    # ``enforced`` (default when a role is present) authorizes the selected
+    # route; ``shadow`` records a recommendation while preserving the legacy
+    # launch byte-for-byte.  A separate receipt column prevents observation
+    # from ever becoming worker authority by accident.
+    ("routing_mode", "routing_mode TEXT"),
+    ("routing_shadow_receipt_id", "routing_shadow_receipt_id TEXT"),
+    # Genuine per-task routing requirements (plans/2026-09-15_141016-guided-
+    # model-routing.md §3.B): validated JSON object with optional
+    # task_class/required_capabilities/input_tokens/reserve_tokens/provenance.
+    # NULL = no explicit intake; resolve_task_route() applies conservative
+    # documented defaults (unclassified -> deep quality floor), never a
+    # fabricated fixed shape. See kanban_model_routing.validate_routing_requirements.
+    ("routing_requirements", "routing_requirements TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

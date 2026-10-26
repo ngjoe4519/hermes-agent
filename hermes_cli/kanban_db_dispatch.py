@@ -1380,6 +1380,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
     infrastructure: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
@@ -1393,6 +1394,14 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``expected_run_id``, when given (the spawn-failure path always has it —
+    the run it just claimed), is a CAS guard: this call must never release
+    the claim / end the run / restore the phase of a NEWER run that a
+    concurrent reclaim already installed. When the task's live
+    ``current_run_id`` has moved past ``expected_run_id`` this becomes a
+    pure counter-only bookkeeping no-op — the successor run's claim, status,
+    and run row are left completely untouched.
 
     ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
     #114720) — nothing about the card ran, so the run and event are recorded
@@ -1410,6 +1419,14 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        live_run_id = row["current_run_id"]
+        # A concurrent reclaim/replace has already superseded the run this
+        # caller is reporting on — never touch the successor's claim/run.
+        stale_claim = (
+            expected_run_id is not None
+            and release_claim
+            and live_run_id != expected_run_id
+        )
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1425,41 +1442,65 @@ def _record_task_failure(
             effective_limit, limit_source = int(failure_limit), "dispatcher"
 
         if infrastructure or not (force_trip or failures >= effective_limit):
-            if release_claim:
+            if release_claim and not stale_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error, task_id),
-                )
-            else:
+                # CAS on current_run_id only when the caller supplied one to
+                # guard against (bare release_claim=True with no
+                # expected_run_id is the pre-existing unconditional-release
+                # contract and must keep working unchanged).
+                if expected_run_id is not None:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                        (retry_status, failures, error, task_id, expected_run_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running'",
+                        (retry_status, failures, error, task_id),
+                    )
+            elif not stale_claim:
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error, task_id),
                 )
             # Timeout/crash path's caller already emitted its own event.
-            if end_run:
+            # A stale spawn-failure never closes/emits against the
+            # successor's run — there is nothing of this attempt left to
+            # report against once the claim moved on.
+            if end_run and not stale_claim:
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
+                    expected_run_id=expected_run_id,
                 )
                 _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
 
+        if stale_claim:
+            # Even a breaker-tripping failure on a stale claim must not touch
+            # the successor's status/claim/run — nothing left to trip.
+            return False
+
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
+        # state; the timeout/crash path already did. CAS on current_run_id
+        # only when the caller supplied one to guard against.
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            "WHERE id = ? AND status IN ('running', 'ready', 'review')"
+            + (" AND current_run_id = ?" if release_claim and expected_run_id is not None else ""),
+            (failures, error, task_id, *((expected_run_id,) if release_claim and expected_run_id is not None else ())),
         )
         payload = {
             "failures": failures,
@@ -1481,6 +1522,7 @@ def _record_task_failure(
                     "limit_source": limit_source,
                     "retry_status": retry_status,
                 },
+                expected_run_id=expected_run_id,
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
@@ -1492,26 +1534,65 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *,
+    run_id=None, claim_lock=None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     """Publish the launcher only while this claim has no executing worker yet, together with its
     restart-stable fingerprint (``_process_fingerprint``); the ``spawned`` event carries both. The
     fingerprint is what lets every later liveness/kill decision tell OUR worker from a process that
     recycled the PID after a reboot. A failed capture is persisted as ``UNVERIFIED_WORKER_FINGERPRINT``,
     never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
-    not inherit."""
+    not inherit.
+
+    Guided-routing ownership: a managed task (``routing_role`` set, mode not ``shadow``) must
+    register under its receipted run — ``expected_run_id`` is mandatory.
+    Re-registering the SAME pid with the SAME fingerprint under the same live run stays True
+    (idempotent); any other owner is a rejection (False, no event) so the dispatcher can fail the
+    spawn closed instead of letting two attempts share a card."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
+        task = _kb.get_task(conn, task_id)
+        if task is None:
+            return False
+        managed = bool(task.routing_role and task.routing_mode != "shadow")
+        if managed and expected_run_id is None:
+            return False
+        if managed and started_at is UNVERIFIED_WORKER_FINGERPRINT:
+            # A managed registration must carry a real restart-stable fingerprint; the
+            # UNVERIFIED sentinel would hand a later kill decision bare-PID authority.
+            return False
+        if expected_run_id is not None:
+            run = conn.execute(
+                "SELECT worker_pid, ended_at FROM task_runs WHERE id=? AND task_id=?",
+                (expected_run_id, task_id),
+            ).fetchone()
+            if (task.current_run_id != expected_run_id or not task.claim_lock
+                    or run is None or run["ended_at"] is not None):
+                return False
+            if managed and (task.worker_pid is not None or run["worker_pid"] is not None):
+                # Idempotent re-registration of THIS worker only; any other owner is a conflict.
+                row = conn.execute(
+                    "SELECT worker_pid, worker_started_at FROM tasks WHERE id=?", (task_id,),
+                ).fetchone()
+                return (row is not None and task.worker_pid == int(pid) == run["worker_pid"]
+                        and row["worker_started_at"] == started_at)
         if run_id is None:
-            run_id = _kb._current_run_id(conn, task_id)
+            run_id = expected_run_id if expected_run_id is not None else _kb._current_run_id(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? AND status = 'running' "
             "AND current_run_id IS ? AND worker_pid IS NULL "
             "AND (? IS NULL OR claim_lock = ?)",
             (int(pid), started_at, task_id, run_id, claim_lock, claim_lock))
-        if cur.rowcount:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
+        if not cur.rowcount:
+            # Another worker already published under this claim (or the claim moved on):
+            # keep the pre-existing registration untouched — never clobber a live owner.
+            return False
+        conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                     (int(pid), started_at, run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        return True
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -2127,6 +2208,96 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if getattr(claimed, "routing_role", None) and getattr(claimed, "routing_mode", None) == "shadow":
+        # Observation only: preserve every legacy launch field and swallow all
+        # selector/store failures after recording a bounded task event.  A
+        # shadow receipt has its own column and is never exported to the worker.
+        try:
+            from hermes_cli.kanban_model_routing import observe_task_route as _observe_task_route
+            from hermes_constants import get_hermes_home as _get_hermes_home
+
+            _observe_task_route(
+                str(_get_hermes_home()), conn, claimed, now=int(time.time()),
+                frozen_sha=os.environ.get("HERMES_KANBAN_ROUTING_FROZEN_SHA", "unknown"),
+                verified_by=os.environ.get("HERMES_KANBAN_ROUTING_VERIFIED_BY", "kanban-dispatcher"),
+            )
+        except Exception as exc:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, claimed.id, "routing_shadow_failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "reason": getattr(exc, "reason", type(exc).__name__),
+                    },
+                    run_id=claimed.current_run_id,
+                )
+    elif getattr(claimed, "routing_role", None):
+        # Guided model routing (plans/2026-09-15_141016-guided-model-routing.md
+        # §4 step 4): resolve NOW, against the live policy/approval, never at
+        # card-creation time. A resolution failure is a real spawn failure —
+        # it must go through the normal breaker/re-queue path, never fall
+        # back to an unmanaged default route (design §5, "no silent escape").
+        try:
+            from agent.model_selection_types import RoutingBlocked as _RoutingBlocked
+            from hermes_cli.kanban_model_routing import resolve_task_route as _resolve_task_route
+            from hermes_constants import get_hermes_home as _get_hermes_home
+        except Exception:
+            raise
+        # This IS the origin authority: the profile whose policy/model_routing.db
+        # actually governs this dispatch tick, independent of which profile the
+        # claimed task is assigned to run under. A dispatcher dispatching to a
+        # different assignee's profile (origin A -> worker B) must have B's
+        # worker validate against A's receipt store, never B's own default —
+        # threaded through explicitly below rather than re-derived by the
+        # worker from its own (possibly different) HERMES_HOME.
+        origin_hermes_home = str(_get_hermes_home())
+        from agent.model_selection_store import managed_recovery_hold as _managed_recovery_hold
+
+        completed_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS run_id FROM task_runs "
+            "WHERE task_id=? AND outcome='completed'",
+            (claimed.id,),
+        ).fetchone()
+        recovery_hold = _managed_recovery_hold(
+            origin_hermes_home, "kanban", claimed.id,
+            after_attempt_id=int(completed_row["run_id"] or 0),
+        )
+        if recovery_hold is not None:
+            if _record_task_failure(
+                conn, claimed.id, recovery_hold,
+                outcome="spawn_failed", force_trip=True, release_claim=True, end_run=True,
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            return False
+        # Receipt minting only: resolve_task_route persists the decision as an
+        # audit row (claim/run CAS via set_routing_receipt) and raises
+        # RoutingBlocked on policy failure. The resolved provider/model/
+        # reasoning are mirrored onto the claimed attempt object below; they
+        # are NOT propagated to the worker process — kanban workers submit
+        # only {board, task_id, run_id, claim_lock} to the gateway, which
+        # re-derives the session from the task row. Worker-side routing
+        # enforcement is pending a redesign around the gateway kanban.run
+        # contract.
+        try:
+            kwargs = _resolve_task_route(
+                origin_hermes_home, conn, claimed,
+                now=int(time.time()),
+                frozen_sha=os.environ.get("HERMES_KANBAN_ROUTING_FROZEN_SHA", "unknown"),
+                verified_by=os.environ.get("HERMES_KANBAN_ROUTING_VERIFIED_BY", "kanban-dispatcher"),
+            )
+        except _RoutingBlocked as exc:
+            if _record_task_failure(
+                conn, claimed.id, f"routing: {exc}",
+                outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            return False
+        if kwargs is not None:
+            claimed.provider_override = kwargs["provider"]
+            claimed.model_override = kwargs["model"]
+            claimed.reasoning_effort = kwargs["reasoning_effort"]
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2137,6 +2308,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2151,7 +2323,12 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+            if not _set_worker_pid(
+                conn, claimed.id, int(pid),
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                expected_run_id=claimed.current_run_id,
+            ):
+                raise RuntimeError("worker registration rejected: stale or conflicting run owner")
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2171,6 +2348,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
             infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)

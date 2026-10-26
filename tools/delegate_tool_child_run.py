@@ -129,6 +129,13 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
     except (ValueError, UnboundLocalError) as e:
         logger.debug("Could not remove child from active_children: %s", e)
 
+def discard_unstarted_children(parent_agent: Any, children: list) -> None:
+    """A failed batch never transfers these children to the run/cleanup owner."""
+    for _index, _task, child in children:
+        _detach_child(parent_agent, child)
+        _close_child(child, "Failed to close unstarted delegation child")
+
+
 def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "parent delegation ended") -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly. ``tool_reason`` is the
     fixed cause the child's tools see (a pending approval wait reports it instead of a user deny)."""
@@ -656,6 +663,15 @@ def _build_result_entry(
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
+    managed_receipt = getattr(child, "_managed_routing_receipt_id", None)
+    shadow_receipt = getattr(child, "_shadow_routing_receipt_id", None)
+    shadow_error = getattr(child, "_shadow_routing_error", None)
+    if isinstance(managed_receipt, str) and managed_receipt:
+        entry["routing_receipt_id"] = managed_receipt
+    if isinstance(shadow_receipt, str) and shadow_receipt:
+        entry["routing_shadow_receipt_id"] = shadow_receipt
+    if isinstance(shadow_error, str) and shadow_error:
+        entry["routing_shadow_error"] = shadow_error
     _route = _route_report(child)
     if _route is not None:
         entry["route"] = _route

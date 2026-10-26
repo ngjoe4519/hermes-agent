@@ -393,6 +393,45 @@ def _price_reference_response(
         return usage, None, None, None
 
 
+def _resolve_moa_slot_managed_route(slot: dict[str, Any], *, execution_id: str, slot_id: str) -> Any:
+    """Guided model routing (plans/2026-09-15_141016-guided-model-routing.md §6 "MoA"): a slot
+    carrying an explicit ``routing_role`` resolves through the SAME neutral selector/store Kanban
+    and delegation use. Returns ``None`` for the existing unmanaged path (no ``routing_role``),
+    byte-for-byte unchanged. Raises ``RoutingBlocked`` on a real resolution failure -- the caller
+    must NOT fall back to the slot's plain provider/model (§5 no silent escape).
+
+    Uses the PINNED per-``(execution_id, slot_id)`` cache, not a fresh ``resolve_moa_slot_route``
+    call: the joint cohort resolution (``resolve_moa_cohort_pinned``, run once up-front for the
+    whole cohort) seeds this exact cache, so every reference/aggregator call within the SAME live
+    run reuses the identical resolution already validated for cohort diversity -- never a second,
+    independent per-slot resolution that could silently disagree with the pinned cohort.
+    """
+    from agent.moa_model_routing import resolve_moa_slot_route_pinned
+
+    return resolve_moa_slot_route_pinned(slot, execution_id=execution_id, slot_id=slot_id)
+
+
+def _slot_runtime_managed(slot: dict[str, Any], *, execution_id: str, slot_id: str) -> tuple[dict[str, Any], Any]:
+    """``(runtime_kwargs, managed_resolution_or_None)`` for one MoA slot.
+
+    Unmanaged slots (no ``routing_role``) are the existing ``_slot_runtime`` path, untouched.
+    Managed slots get their real provider/model/endpoint/reasoning from
+    ``agent.moa_model_routing.moa_runtime_overrides`` -- authoritative, never merged with the
+    plain-slot cache (§5).
+    """
+    resolution = _resolve_moa_slot_managed_route(slot, execution_id=execution_id, slot_id=slot_id)
+    if resolution is None or resolution.get("routing_mode", "enforced") == "shadow":
+        if resolution and resolution.get("shadow_error"):
+            logger.warning(
+                "MoA routing shadow observation failed for %s: %s",
+                slot_id, resolution["shadow_error"],
+            )
+        return _slot_runtime(slot), None
+    from agent.moa_model_routing import moa_runtime_overrides
+
+    return moa_runtime_overrides(resolution), resolution
+
+
 def _slot_request_headers(runtime: dict[str, Any], agent: Any = None) -> dict[str, str] | None:
     """User-initiated request headers of the slot's provider, attributed at that provider's own endpoint
     (MoA attributes by slot provider, whatever account host the slot resolved to). Asked like every
@@ -413,15 +452,50 @@ def _run_reference(
     slot: dict[str, Any], ref_messages: list[dict[str, Any]], *, temperature: float | None = None,
     max_tokens: int | None = None, reference_timeout: float | None = None, context_length_cache: Any = None,
     cache_disabled: bool | None = None, cache_ttl: str | None = None, agent: Any = None,
+    execution_id: str = "moa-turn", slot_id: str = "",
 ) -> tuple[str, str, Any]:
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
-    a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
+    a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool.
+
+    A guided-routing-managed slot (``routing_role`` set) resolves its actual route through
+    ``agent.moa_model_routing`` and is re-validated against its receipt (``enforce_moa_slot_route``)
+    immediately before this call's real ``call_llm`` -- a denied/mismatched managed slot is caught
+    here and becomes the SAME labelled ``[failed: ...]`` note as any other reference failure,
+    never a silent fallback to the slot's plain provider/model.
+    """
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
+    try:
+        runtime, managed_resolution = _slot_runtime_managed(slot, execution_id=execution_id, slot_id=slot_id)
+    except Exception as exc:
+        logger.warning("MoA reference model %s routing failed: %s", label, exc)
+        from agent.moa_model_routing import MoARequiredSlotDenied, is_moa_slot_required
+
+        if is_moa_slot_required(slot):
+            # Design §6 "MoA": a required reference's failure means "gate incomplete, not
+            # silent success via aggregator-only fallback" -- the caller must propagate this,
+            # never swallow it into the ordinary [failed: ...] degraded-advisor note.
+            raise MoARequiredSlotDenied(slot_id, slot.get("routing_role", ""), "route_denied", str(exc)) from exc
+        note = f"[failed: {exc}]"
+        return label, note, _RefAccounting(CanonicalUsage(), messages=[], output=note, model=slot.get("model"), provider=slot.get("provider"), temperature=temperature)
+    # A managed slot's receipted reasoning is a real ``reasoning_effort`` string, not a
+    # ``call_llm`` kwarg -- translate it the same way ``_slot_reasoning_config`` does for a
+    # plain slot, and keep it OFF the runtime dict passed as **runtime below.
+    managed_reasoning_effort = runtime.pop("reasoning_effort", None) if managed_resolution is not None else None
+    reasoning_config = _slot_reasoning_config({"reasoning_effort": managed_reasoning_effort}) if managed_reasoning_effort else _slot_reasoning_config(slot)
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
     try:
+        if managed_resolution is not None:
+            # The actual call-boundary guard check (design §12): re-validates the ACTUAL
+            # constructed provider/model/endpoint/reasoning against the receipted decision
+            # immediately before content is sent -- not merely stamping an attribute nothing reads.
+            from agent.moa_model_routing import enforce_moa_slot_route
+
+            enforce_moa_slot_route(
+                managed_resolution, actual_provider=runtime.get("provider"), actual_model=runtime.get("model"),
+                actual_endpoint=runtime.get("base_url"), actual_reasoning=managed_reasoning_effort,
+            )
         # Trim to THIS model's window (advisors may be smaller than the aggregator); the
         # advisory view is append-only across iterations, so cache_control lets
         # iteration N+1 replay N's cached prefix.
@@ -429,36 +503,60 @@ def _run_reference(
         # advising a glm-5.2 @ 1M conversation); without this trim the provider returns a hard HTTP 400
         # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
         # advisory system prompt is prepended so its tokens count against the budget too.
-        trimmed = _trim_messages_for_reference(
-            messages, slot, runtime, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache,
-        )
+        if managed_resolution is not None:
+            from agent.managed_route_budget import enforce_input_budget
+
+            enforce_input_budget(managed_resolution["routing_home"], managed_resolution["receipt_id"],
+                                 messages, max_tokens=max_tokens)
+            trimmed = messages  # Never trim to disguise failed initial qualification.
+        else:
+            trimmed = _trim_messages_for_reference(
+                messages, slot, runtime, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache,
+            )
         trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
 
         # Providers may gate premium models on request attribution; MoA fan-out serves the
         # user's current turn, so mirror the main agent's user-initiated request headers.
         initiator_headers = _slot_request_headers(runtime, agent)
-        if agent is not None:
-            from agent.auxiliary_client import aux_progress_hook
+        from agent.managed_route_aux_wire import observe_moa_request
+        from agent.managed_route_health import record_response_identity
+        health_route = managed_resolution or {}
+        with observe_moa_request(health_route.get("routing_home"), health_route.get("receipt_id")) as observation:
+            if agent is not None:
+                from agent.auxiliary_client import aux_progress_hook
 
-            with aux_progress_hook(_reference_liveness_hook(agent, label)):
+                with aux_progress_hook(_reference_liveness_hook(agent, label)):
+                    response = call_llm(
+                        task="moa_reference", messages=trimmed, temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=reference_timeout, reasoning_config=reasoning_config,
+                        extra_headers=initiator_headers, **runtime,
+                    )
+            else:
                 response = call_llm(
                     task="moa_reference", messages=trimmed, temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
+                    timeout=reference_timeout, reasoning_config=reasoning_config,
                     extra_headers=initiator_headers, **runtime,
                 )
-        else:
-            response = call_llm(
-                task="moa_reference", messages=trimmed, temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-                extra_headers=initiator_headers, **runtime,
-            )
-        output_text = _extract_text(response) or "(empty response)"
+            record_response_identity(observation, response)
+        output_text = _extract_text(response)
+        from agent.moa_model_routing import MoARequiredSlotDenied, is_moa_slot_required
+        if is_moa_slot_required(slot) and not (output_text or "").strip():
+            raise MoARequiredSlotDenied(slot_id, slot["routing_role"], "empty_output", "required reference returned empty output")
+        output_text = output_text or "(empty response)"
         acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
         return label, output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        from agent.moa_model_routing import MoARequiredSlotDenied, is_moa_slot_required
+
+        if is_moa_slot_required(slot):
+            # Same fail-closed contract as the routing-resolution except above: a required
+            # managed slot's call-boundary denial (enforce_moa_slot_route) or transport failure
+            # must hard-fail the attempt, not degrade into a [failed: ...] advisor note that lets
+            # aggregation quietly proceed as if the gate were satisfied.
+            raise MoARequiredSlotDenied(slot_id, slot.get("routing_role", ""), "call_failed", str(exc)) from exc
         note = f"[failed: {exc}]"
         return label, note, _RefAccounting(CanonicalUsage(), messages=messages, output=note, **trace_fields)
 
@@ -618,6 +716,7 @@ def _run_references_parallel(
     reference_models: list[dict[str, Any]], ref_messages: list[dict[str, Any]], *,
     temperature: float | None = None, max_tokens: int | None = None, progress_callback: Any = None,
     reference_timeout: float | None = None, agent: Any = None, late_accounting_sink: Any = None,
+    execution_id: str = "moa-turn",
 ) -> list[tuple[str, str, Any]]:
     """Fan out all reference models in parallel; ``(label, text, _RefAccounting)`` per
     slot in ``reference_models`` order.
@@ -675,6 +774,8 @@ def _run_references_parallel(
                     cache_disabled=cache_disabled,
                     cache_ttl=cache_ttl,
                     agent=agent,
+                    execution_id=execution_id,
+                    slot_id=f"reference-{idx}",
                 )
             ] = idx
 
@@ -928,9 +1029,20 @@ def aggregate_moa_context(
     ``reference_max_tokens`` to both calls here would silently reintroduce that regression.
     """
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
+    from agent.moa_model_routing import cohort_has_managed_slot, execution_id_for_agent, resolve_moa_cohort_pinned
+
+    execution_id = execution_id_for_agent(agent, "moa-oneshot")
+    if cohort_has_managed_slot(reference_models, aggregator):
+        # Design §6 "MoA": resolve the COMPLETE cohort (every reference + aggregator) ONCE,
+        # jointly, before ANY slot content is sent -- never per-slot on first touch. The
+        # execution_id is the genuine per-attempt identity of THIS live run (the caller's bound
+        # turn, or a fresh id if none is bound), so a NEW oneshot invocation always gets a fresh
+        # cohort decision while nothing here is shared across unrelated calls.
+        resolve_moa_cohort_pinned(reference_models, aggregator, execution_id=execution_id)
     reference_outputs = _run_references_parallel(
         reference_models, _reference_messages(api_messages), temperature=temperature,
         max_tokens=reference_max_tokens, reference_timeout=reference_timeout, agent=agent,
+        execution_id=execution_id,
     )
     privacy_full = False
     try:
@@ -961,19 +1073,64 @@ def aggregate_moa_context(
     )
 
     agg_label = _slot_label(aggregator)
-    agg_runtime = _slot_runtime(aggregator)
+    from agent.moa_model_routing import MoARequiredSlotDenied, is_moa_slot_required
+
+    agg_required = is_moa_slot_required(aggregator)
+    try:
+        agg_runtime, agg_managed_resolution = _slot_runtime_managed(aggregator, execution_id=execution_id, slot_id="aggregator")
+    except Exception as exc:
+        logger.warning("MoA aggregator model %s routing failed: %s", agg_label, exc)
+        if agg_required:
+            # A required aggregator is the whole point of the review gate; an aggregator
+            # routing failure here must NOT silently degrade to "proceeding without aggregated
+            # guidance" (that is empty/unmanaged synthesis wearing a friendly banner).
+            raise MoARequiredSlotDenied("aggregator", aggregator.get("routing_role", ""), "route_denied", str(exc)) from exc
+        return (
+            "[Mixture of Agents context — aggregator routing failed. "
+            "Proceeding without aggregated guidance.]\n"
+            f"References: {_slot_labels(reference_models)}\n\n"
+            f"{joined}"
+        )
+    agg_managed_reasoning_effort = agg_runtime.pop("reasoning_effort", None) if agg_managed_resolution is not None else None
+    agg_reasoning_config = (
+        _slot_reasoning_config({"reasoning_effort": agg_managed_reasoning_effort})
+        if agg_managed_reasoning_effort else _aggregator_reasoning_config(aggregator)
+    )
     _touch_fanout_progress(
         agent, f"MoA: synthesizing aggregator guidance ({agg_label})"
     )
     try:
+        if agg_managed_resolution is not None:
+            from agent.moa_model_routing import enforce_moa_slot_route
+
+            enforce_moa_slot_route(
+                agg_managed_resolution, actual_provider=agg_runtime.get("provider"), actual_model=agg_runtime.get("model"),
+                actual_endpoint=agg_runtime.get("base_url"), actual_reasoning=agg_managed_reasoning_effort,
+            )
         # Undecorated: the prompt embeds this call's reference outputs, so no later call
         # reads it back and a marker would only pay a cache write (is_one_shot_request).
-        synthesis = _extract_text(call_llm(
-            task="moa_aggregator", messages=[{"role": "user", "content": synth_prompt}], temperature=aggregator_temperature,
-            reasoning_config=_aggregator_reasoning_config(aggregator), **agg_runtime,
-        ))
+        agg_messages = [{"role": "user", "content": synth_prompt}]
+        if agg_managed_resolution is not None:
+            from agent.managed_route_budget import enforce_input_budget
+
+            enforce_input_budget(agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"], agg_messages)
+        from agent.managed_route_aux_wire import observe_moa_request
+        from agent.managed_route_health import record_response_identity
+        health_route = agg_managed_resolution or {}
+        with observe_moa_request(health_route.get("routing_home"), health_route.get("receipt_id")) as observation:
+            synthesis = _extract_text(record_response_identity(observation, call_llm(
+                task="moa_aggregator", messages=agg_messages, temperature=aggregator_temperature,
+                reasoning_config=agg_reasoning_config, **agg_runtime,
+            )))
+        if agg_required and not (synthesis or "").strip():
+            raise MoARequiredSlotDenied("aggregator", aggregator["routing_role"], "empty_output", "required aggregator returned empty output")
     except Exception as exc:
         logger.warning("MoA aggregator model %s failed: %s", agg_label, exc)
+        if agg_required:
+            # The enforce_moa_slot_route call-boundary denial (or any transport failure) for a
+            # required aggregator lands here too; must hard-fail rather than fall through to
+            # "synthesis = ''" which the return below would present as a normal (empty) result.
+            raise MoARequiredSlotDenied("aggregator", aggregator.get("routing_role", ""), "call_failed", str(exc)) from exc
         synthesis = ""
 
     return (
@@ -1013,6 +1170,7 @@ def _completed_response_as_stream_chunk(response: Any) -> Any:
     )
     return SimpleNamespace(
         id=getattr(response, "id", None), model=getattr(response, "model", None), choices=[choice], usage=getattr(response, "usage", None),
+        _hermes_reported_model=getattr(response, "_hermes_reported_model", getattr(response, "model", None)),
     )
 
 
@@ -1207,10 +1365,36 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        agg_runtime = _slot_runtime(aggregator)
+        from agent.moa_model_routing import execution_id_for_agent
+
+        execution_id = execution_id_for_agent(self._agent, f"moa-preset-{getattr(self, 'preset_name', 'unknown')}")
+        agg_runtime, agg_managed_resolution = _slot_runtime_managed(
+            aggregator, execution_id=execution_id, slot_id="aggregator",
+        )
+        if agg_managed_resolution is not None:
+            # Actual call-boundary guard (design §12): re-validated against the receipt
+            # immediately before the real aggregator inference below, not merely stamped.
+            from agent.moa_model_routing import enforce_moa_slot_route
+
+            agg_managed_reasoning_effort = agg_runtime.pop("reasoning_effort", None)
+            enforce_moa_slot_route(
+                agg_managed_resolution, actual_provider=agg_runtime.get("provider"), actual_model=agg_runtime.get("model"),
+                actual_endpoint=agg_runtime.get("base_url"), actual_reasoning=agg_managed_reasoning_effort,
+            )
+        else:
+            agg_managed_reasoning_effort = None
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
+        if agg_managed_resolution is not None and self._agent is not None:
+            # The virtual agent executes the aggregator's tool calls. Its
+            # delegation ceiling belongs to this turn, not its virtual provider.
+            self._agent._managed_moa_authority = (execution_id, agg_managed_resolution)
+        if agg_managed_resolution is not None:
+            from agent.managed_route_budget import enforce_input_budget
+
+            enforce_input_budget(agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"],
+                                 agg_messages, tools, api_kwargs.get("max_tokens"))
         trace = self._pending_trace
         if trace is not None:
             trace["aggregator_label"] = _slot_label(aggregator)
@@ -1236,11 +1420,45 @@ class MoAChatCompletions:
         send = functools.partial(
             call_llm, task="moa_aggregator", temperature=prepared["aggregator_temperature"],
             max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
-            reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
+            reasoning_config=(
+                _slot_reasoning_config({"reasoning_effort": agg_managed_reasoning_effort})
+                if agg_managed_reasoning_effort else _aggregator_reasoning_config(aggregator)
+            ),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
         )
+
+        def _call_aggregator(messages):
+            if agg_managed_resolution is None:
+                return send(messages=messages)
+            if stream:
+                # A lazy stream's health is unknown until it is consumed.  Record a
+                # construction-time exception immediately, otherwise keep the
+                # observation open around iteration below.
+                try:
+                    from agent.managed_route_aux_wire import managed_aux_wire_scope
+                    with managed_aux_wire_scope(
+                        agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"],
+                    ):
+                        return send(messages=messages)
+                except Exception:
+                    from agent.managed_route_health import observe_request
+
+                    with observe_request(
+                        agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"],
+                    ):
+                        raise
+            from agent.managed_route_aux_wire import observe_moa_request
+            from agent.managed_route_health import record_response_identity
+
+            with observe_moa_request(
+                agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"],
+            ) as observation:
+                response = send(messages=messages)
+                record_response_identity(observation, response)
+                return response
+
         try:
-            agg_response = send(messages=agg_messages)
+            agg_response = _call_aggregator(agg_messages)
         except Exception as exc:
             # Strict-alternation template rejected ``user(task), user(guidance)``: merge the pair for
             # THIS destination only and retry once; remember it so later iterations pre-merge.
@@ -1253,7 +1471,7 @@ class MoAChatCompletions:
                 "destination for the rest of the session and retrying once: %.200s", _slot_label(aggregator), exc,
             )
             agg_messages = retry_messages
-            agg_response = send(messages=agg_messages)
+            agg_response = _call_aggregator(agg_messages)
         if trace is not None:
             # Trace the exact aggregator INPUT as sent (persisted copy redacted; live input raw).
             trace["aggregator_input_messages"] = (
@@ -1269,7 +1487,13 @@ class MoAChatCompletions:
         if stream and hasattr(agg_response, "choices"):
             # Some adapters (openai-codex Responses) return a completed response even
             # when streaming was requested; hand the loop a one-chunk iterator.
-            return iter((_completed_response_as_stream_chunk(agg_response),))
+            agg_response = iter((_completed_response_as_stream_chunk(agg_response),))
+        if stream and agg_managed_resolution is not None:
+            from agent.managed_route_aux_wire import observe_moa_stream
+
+            return observe_moa_stream(
+                agg_managed_resolution["routing_home"], agg_managed_resolution["receipt_id"], agg_response,
+            )
         return agg_response
 
     def _fanout_cache_key(
@@ -1344,12 +1568,24 @@ class MoAChatCompletions:
         is never capped. None timeout = inherit auxiliary.moa_reference.timeout.
         """
         raw_reference_timeout = preset.get("reference_timeout")
+        from agent.moa_model_routing import cohort_has_managed_slot, execution_id_for_agent, resolve_moa_cohort_pinned
+
+        execution_id = execution_id_for_agent(self._agent, f"moa-preset-{self.preset_name}")
+        if cohort_has_managed_slot(reference_models, aggregator):
+            # Design §6 "MoA": resolve the COMPLETE cohort (every reference + aggregator) ONCE,
+            # jointly, before ANY slot content is sent for this run -- the aggregator call that
+            # follows fan-out (``_call_prepared_aggregator``) reuses this SAME pinned cohort via
+            # the identical execution_id, so the aggregator can never diverge from what the
+            # fan-out was actually validated against.
+            resolve_moa_cohort_pinned(reference_models, aggregator, execution_id=execution_id)
+        self._execution_id = execution_id
         reference_outputs = _run_references_parallel(
             reference_models, ref_messages, temperature=_preset_temperature(preset, "reference_temperature"),
 
             progress_callback=lambda done, total, label: self._emit("moa.progress", refs_done=done, refs_total=total, label=label),
             reference_timeout=float(raw_reference_timeout) if raw_reference_timeout else None,
             agent=self._agent, late_accounting_sink=self._record_late_reference_accounting,
+            execution_id=execution_id,
         )
         # An interrupted fan-out is a partial snapshot: never cache it (a HIT would
         # replay placeholder notes every iteration).

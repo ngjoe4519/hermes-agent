@@ -890,6 +890,7 @@ class _CodexResponseAssembler:
 
     def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta):
         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
+        self.reported_model = None
         self.on_commentary_message, self.on_first_delta = on_commentary_message, on_first_delta
         self.output_items: list[Any] = []
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
@@ -1072,6 +1073,9 @@ class _CodexResponseAssembler:
 
     def feed(self, event: Any) -> bool:
         """Process one event; True when the stream hit a terminal frame."""
+        reported = _event_field(_event_field(event, "response"), "model")
+        if isinstance(reported, str):
+            self.reported_model = reported
         event_type = _event_field(event, "type", "")
         event_type = event_type if isinstance(event_type, str) else ""
         handler = self._EXACT_HANDLERS.get(event_type) or next((h for m, h in self._FUZZY_HANDLERS if m(event_type)), None)
@@ -1111,6 +1115,7 @@ class _CodexResponseAssembler:
         return SimpleNamespace(
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
+            _hermes_reported_model=self.reported_model,
             error=self.terminal_error, service_tier=self.terminal_service_tier)
 
 
@@ -1263,7 +1268,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        final_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        from agent.managed_route_wire import enforce_responses_wire
+        enforce_responses_wire(agent, active_client, final_kwargs)
+        return active_client.responses.create(**final_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

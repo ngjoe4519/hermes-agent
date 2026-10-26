@@ -94,6 +94,80 @@ _STEP_HANDOFF = (
     _arg("--metadata", help="JSON dict of structured facts to store on the latest completed run."),
 )
 
+_ROUTING_SPECS = [
+    _cmd("attest", [
+        _arg("classification_json", help="Execution requirements and reviewed scope classification JSON"),
+        _arg("--expected-version", type=int, required=True),
+        _arg("--approval-ref", required=True, help="Operator approval provenance (not model intake)"),
+        _json_flag(),
+    ], help="Append an operator classification attestation for one exact execution"),
+    _cmd("validate", [_arg("policy_json"), _json_flag()],
+         help="Validate a policy JSON file without publishing or activating it"),
+    _cmd("explain", [_arg("policy_json"), _arg("requirements_json"), _json_flag()],
+         help="Explain a prospective requirements-to-route decision without dispatch or writes"),
+    _cmd("publish", [
+        _arg("policy_json", help="Path to a policy JSON file (schema_version, policy_id, revision, routes, ...)"),
+        _arg("--approval-ref", required=True,
+             help="Human-readable record of who/what approved this revision (required — publishing "
+                  "is an auditable admission step, not silent)."),
+        _json_flag(),
+    ], help="Publish an immutable policy revision (does not activate it)"),
+    _cmd("activate", [
+        _arg("policy_id"),
+        _arg("revision", type=int),
+    ], help="Mark one published revision as the active one used at claim/start time"),
+    _cmd("revoke", [
+        _arg("policy_id"),
+        _arg("--route-id", help="Revoke only this route; omit to revoke every route "
+             "of the policy (whole-policy emergency suspension)"),
+        _arg("--reason", required=True,
+             help="Human-readable reason this route/policy is being emergency-revoked "
+                  "(distinct from an ordinary republish -- required, never inferred)"),
+        _arg("--approval-ref", required=True,
+             help="Human-readable record of who/what approved this revocation"),
+        _json_flag(),
+    ], help="Emergency: explicitly revoke a route (or whole policy) for ALREADY-receipted, "
+            "in-flight attempts -- distinct from publish/activate, which only affect new "
+            "attempts"),
+    _cmd("readmit", [
+        _arg("policy_id"),
+        _arg("--route-id", help="Readmit only this route; omit to readmit the whole "
+             "policy (clears a prior whole-policy revocation)"),
+        _arg("--reason", required=True,
+             help="Human-readable reason this route/policy is being explicitly readmitted "
+                  "(required, never inferred/automatic)"),
+        _arg("--approval-ref", required=True,
+             help="Human-readable record of who/what approved this readmission"),
+        _json_flag(),
+    ], help="Explicitly clear a prior emergency revocation for a route (or whole policy) -- "
+            "the ONLY way to lift a revoke_route block; never implied by publish/activate "
+            "and never automatic/time-based"),
+    _cmd("reconcile", [
+        _arg("receipt_id"),
+        _arg("--reason", required=True,
+             help="What evidence established that replay is safe (required)"),
+        _arg("--approval-ref", required=True,
+             help="Human-readable operator approval provenance for this one replay"),
+        _json_flag(),
+    ], help="Authorize one explicit retry after reconciling an uncertain managed attempt"),
+    _cmd("show", [
+        _arg("policy_id", nargs="?", default="kanban-default"),
+        _json_flag(),
+    ], help="Print the currently active policy (default policy_id: kanban-default)"),
+    _cmd("revisions", [
+        _arg("policy_id", nargs="?", default="kanban-default"),
+        _json_flag(),
+    ], help="List all published revisions of a policy"),
+    _cmd("receipt", [
+        _arg("receipt_id"),
+        _json_flag(),
+    ], help="Show a persisted routing decision receipt"),
+    _cmd("receipt-for-task", [
+        _TASK_ID,
+        _json_flag(),
+    ], help="Show the routing decision receipted for a task's current attempt"),
+]
+
 _BOARD_SPECS = [
     _cmd("list", [
         _json_flag(),
@@ -205,6 +279,25 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--routing-role", dest="routing_role",
+             help="Opt this task into guided model routing for the given role "
+                  "(e.g. builder, reviewquality). Resolved against the active "
+                  "policy at claim/start time, not now; a receipted decision "
+                  "pins the worker's actual provider/model/reasoning. See "
+                  "`hermes kanban routing`."),
+        _arg("--routing-mode", dest="routing_mode", choices=("enforced", "shadow"),
+             help="Routing behavior when --routing-role is set. 'enforced' (default) "
+                  "authorizes and pins the selected route; 'shadow' records a "
+                  "recommendation but preserves the legacy worker route and outcomes."),
+        _arg("--routing-requirements", dest="routing_requirements", metavar="JSON",
+             help="Genuine per-task routing requirements as a JSON object "
+                  "(design §3.B): task_class (established-pattern|investigative|"
+                  "cross-component|high-consequence), required_capabilities "
+                  "(list), input_tokens/reserve_tokens (ints), provenance "
+                  "({frozen_sha, verified_by, complete, contributors:[{maker,...}]}) "
+                  "for review roles. Validated at creation; omitted fields default "
+                  "conservatively at claim time (unclassified scope -> deep), "
+                  "never fabricated. Only meaningful with --routing-role."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -450,6 +543,16 @@ _SPECS = [
              "the same narrow auto-repair the connect-time guard applies. Any other corruption "
              "class is reported and left untouched (fail-closed). Exits 0 when the DB is healthy "
              "or was repaired, non-zero when it is still corrupt."
+         )),
+    _cmd("routing", children=("routing_action", _ROUTING_SPECS),
+         help="Guided model routing: publish/activate policy revisions, inspect receipts",
+         description=(
+             "Manage the origin profile's guided-routing policy used to resolve "
+             "--routing-role tasks at claim time. See "
+             "website/docs/user-guide/features/kanban-worker-lanes.md "
+             "(Guided model routing). Publishing/activating a policy is a "
+             "local, auditable admission step — it never itself dispatches a "
+             "worker or changes a running task's route."
          )),
 ]
 
