@@ -17,6 +17,7 @@ import {
 } from '@/store/composer'
 import { type ComposerDraftRetry, draftRetry } from '@/store/composer-draft-retry'
 import { resetBrowseState } from '@/store/composer-input-history'
+import { journalOutgoingSend, type OutgoingSend } from '@/store/composer-outbox'
 import { enqueueQueuedPrompt, type QueuedPromptEntry, serverOwnsComposerQueue } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { notify } from '@/store/notifications'
@@ -51,7 +52,8 @@ interface UseComposerSubmitArgs {
   onSteer: ChatBarProps['onSteer']
   onSteerHidden: ChatBarProps['onSteerHidden']
   onSubmit: ChatBarProps['onSubmit']
-  queueCurrentDraft: () => boolean | Promise<boolean>
+  /** `submissionId`: the restored send this draft retries, so the owner deduplicates it. */
+  queueCurrentDraft: (submissionId?: string) => boolean | Promise<boolean>
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
@@ -127,6 +129,8 @@ export function useComposerSubmit({
     let restoreScope = submittedScope
     const submittedAttachments = attachments ?? []
 
+    let outgoing: OutgoingSend | undefined
+
     // Only this operation's explicit session.create handoff may re-home a
     // pre-session submit. A null → stored render can also be user navigation.
     const assignment =
@@ -134,6 +138,7 @@ export function useComposerSubmit({
         ? {
             onComposerScopeAssigned: (scope: string) => {
               restoreScope = scope
+              outgoing?.move(scope)
             }
           }
         : {}
@@ -142,6 +147,12 @@ export function useComposerSubmit({
     // (the explicit retry), else a new one. Equal text never inherits an identity, so a new
     // message that repeats an uncertain send, in this pane or another, is its own turn.
     const submissionId = target?.submission_id ?? crypto.randomUUID()
+
+    // Journaled before the send chain's first await: closing or reloading the window inside that
+    // chain must not take the words with it (see composer-outbox).
+    outgoing = displayKind
+      ? undefined
+      : journalOutgoingSend(submittedScope, draftRetry(submissionId, text, submittedAttachments))
 
     const restore = () => {
       stashAt(restoreScope, text, submittedAttachments)
@@ -169,6 +180,7 @@ export function useComposerSubmit({
     )
       .then(accepted => void (accepted === false ? rejected() : clearSessionDraft(submittedScope)))
       .catch(rejected)
+      .finally(() => outgoing?.retire())
   }
 
   // External "submit this prompt" requests (e.g. the review pane's agent-ship
@@ -258,6 +270,19 @@ export function useComposerSubmit({
     }
   }
 
+  // A restored send retried while the session is busy keeps its identity: it is admitted as the next
+  // turn under that submission id (never a steer, which carries none), so the owner deduplicates it
+  // against the interrupted original. A refused enqueue leaves the draft, and gives it back its id.
+  const queueRetry = (retry: ComposerDraftRetry) => {
+    const scope = draftScopeRef.current
+
+    void Promise.resolve(queueCurrentDraft(retry.id)).then(queued => {
+      if (!queued) {
+        rememberDraftRetry?.(scope, retry)
+      }
+    })
+  }
+
   // Returns false when the submit was refused and must not refocus the input.
   const submitWhileBusy = (text: string, payloadPresent: boolean, blockingPrompt: boolean) => {
     // Slash commands should execute immediately even while the agent is
@@ -285,6 +310,14 @@ export function useComposerSubmit({
       triggerHaptic('submit')
       clearDraft()
       dispatchSubmit(text, undefined, undefined, retry && { submission_id: retry.id })
+
+      return true
+    }
+
+    const retry = payloadPresent ? takeDraftRetry?.(text, cloneAttachments(attachments)) : undefined
+
+    if (retry) {
+      queueRetry(retry)
     } else if (!blockingPrompt && !attachments.length && text.trim()) {
       // Busy Send follows the backend busy-input policy: interrupt redirects
       // the live turn (Cursor-style stop-and-correct), steer injects at the
@@ -470,6 +503,14 @@ export function useComposerSubmit({
   // tool boundary. If the turn already ended, queue the words instead.
   const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
     const text = draftRef.current.trim()
+    // The Steer action on a restored send: queued under its id like a busy Enter (see queueRetry).
+    const retry = attachments.length ? undefined : takeDraftRetry?.(draftRef.current, [])
+
+    if (retry) {
+      queueRetry(retry)
+
+      return
+    }
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
     // fired on a fast Enter must not be dropped because state hasn't synced.
@@ -542,7 +583,14 @@ export function useComposerSubmit({
     }
 
     const editorHadFocus = editorHasFocus()
-    queueCurrentDraft()
+    const retry = takeDraftRetry?.(draftRef.current, cloneAttachments(attachments))
+
+    if (retry) {
+      queueRetry(retry)
+    } else {
+      queueCurrentDraft()
+    }
+
     refocusAfterSend(editorHadFocus)
   }
 
