@@ -935,6 +935,7 @@ export const deOverrides = {
       appearance: 'Darstellung',
       workspace: 'Arbeitsbereich',
       safety: 'Sicherheit',
+      browser: 'Browser',
       memory: 'Speicher & Kontext',
       voice: 'Sprache',
       advanced: 'Erweitert'

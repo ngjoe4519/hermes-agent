@@ -446,6 +446,7 @@ export const ruOverrides = {
       appearance: 'Внешний вид',
       workspace: 'Рабочее пространство',
       safety: 'Безопасность',
+      browser: 'Браузер',
       memory: 'Память и контекст',
       voice: 'Голос',
       advanced: 'Дополнительно'
