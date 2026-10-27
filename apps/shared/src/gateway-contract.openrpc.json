@@ -20855,6 +20855,18 @@
             "default": null,
             "title": "Display Metadata"
           },
+          "user_timestamp": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Timestamp"
+          },
           "corrections": {
             "anyOf": [
               {
@@ -31989,6 +32001,16 @@
             "default": null,
             "title": "Title Preview"
           },
+          "submitted_at": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Submitted At"
+          },
           "truncate_before_user_ordinal": {
             "anyOf": [
               {
@@ -32121,6 +32143,18 @@
             ],
             "default": null,
             "title": "User Row Id"
+          },
+          "user_timestamp": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Timestamp"
           },
           "survivor_user_row_ids": {
             "anyOf": [
@@ -32389,6 +32423,18 @@
           "user": {
             "title": "User",
             "type": "string"
+          },
+          "user_timestamp": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Timestamp"
           }
         },
         "required": [
