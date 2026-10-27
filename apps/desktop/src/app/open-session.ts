@@ -26,6 +26,7 @@ import {
   reuseBlankDraftTile,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
+import { clearUnreadOnOpen } from '@/store/session-unread-remote'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { $workspaceIsPage, sessionRoute } from './routes'
@@ -125,6 +126,14 @@ export function openSession(
   // already on screen (open tile, or the main session) would otherwise return
   // at focusOpenSession and never clear its unread dot.
   markSessionRead(storedSessionId)
+
+  // ...and the PERSISTED half of that dot. `markSessionRead` only clears the
+  // renderer's finished-turn marker; the backend watermark (`last_read_at`)
+  // is cleared by `clearUnreadOnOpen`, whose only other caller is
+  // `setSelectedStoredSessionId` — unreachable from here when the session is
+  // already focused, which left an explicitly-unread session unread no matter
+  // how often its row was clicked.
+  void clearUnreadOnOpen(storedSessionId)
   setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
   const botWorkspaceScope = workspaceScope.workspaceMode === 'bots' ? workspaceScope : undefined
 

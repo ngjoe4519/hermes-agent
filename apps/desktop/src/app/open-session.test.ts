@@ -14,6 +14,14 @@ const openSessionInNewWindow = vi.fn()
 const canOpenSessionWindow = vi.fn(() => true)
 const workspaceIsPageGet = vi.fn(() => false)
 
+// Persisted-unread write side: every explicit open must clear it, not just the
+// renderer-only finished-turn marker (see open-session.ts).
+const clearUnreadOnOpenMock = vi.fn(async (_storedId: string) => {})
+
+vi.mock('@/store/session-unread-remote', () => ({
+  clearUnreadOnOpen: (storedId: string) => clearUnreadOnOpenMock(storedId)
+}))
+
 vi.mock('@/store/session-states', () => ({
   focusedSessionNeedsRoute: (focused: 'main' | 'tile' | null, workspaceIsPage: boolean) =>
     !focused || (focused === 'main' && workspaceIsPage),
@@ -83,6 +91,7 @@ describe('openSession', () => {
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
     $sessionResumeRequest.set(null)
+    clearUnreadOnOpenMock.mockClear()
   })
 
   it('in-place focuses an existing tile and does not navigate', () => {
@@ -97,6 +106,21 @@ describe('openSession', () => {
     focusOpenSession.mockReturnValue('main')
     openSession('s1', navigate)
     expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('in-place clears the persisted unread marker even when the session is already on screen', () => {
+    // The row the user just clicked is the one main already holds: focusOpenSession
+    // returns 'main', nothing navigates, and setSelectedStoredSessionId (the only
+    // other caller of clearUnreadOnOpen) never runs. The persisted watermark must
+    // still be cleared, or an explicitly-unread session stays unread forever.
+    $selectedStoredSessionId.set('s1')
+    $activeSessionId.set('runtime-current')
+    focusOpenSession.mockReturnValue('main')
+
+    openSession('s1', navigate)
+
+    expect(navigate).not.toHaveBeenCalled()
+    expect(clearUnreadOnOpenMock).toHaveBeenCalledWith('s1')
   })
 
   it('in-place routes when the main session is covered by a page', () => {
