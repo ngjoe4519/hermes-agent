@@ -121,6 +121,23 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
     return load_env_file(path)
 
 
+def expand_managed_refs(obj):
+    """Expand ``${VAR}`` refs in managed values against the process environment only.
+
+    A routed turn binds the secondary profile's secret scope, and user refs rightly resolve through
+    it; a managed ref must not, or a profile's ``.env`` could leave the pin a literal ``${VAR}`` or
+    replace it. The scope is set aside for the expansion and restored after.
+    """
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_cli.config import _expand_env_vars
+
+    token = set_secret_scope(None)
+    try:
+        return _expand_env_vars(obj)
+    finally:
+        reset_secret_scope(token)
+
+
 def apply_managed_overlay(config: dict) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
@@ -135,8 +152,8 @@ def apply_managed_overlay(config: dict) -> dict:
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
-        from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
-        managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
+        from hermes_cli.config import _deep_merge, _normalize_root_model_keys
+        managed_expanded = _normalize_root_model_keys(expand_managed_refs(managed))
         # _normalize_root_model_keys only promotes the string when root provider/base_url
         # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
         # never replaces the caller's ``model`` dict with a string.
@@ -173,3 +190,14 @@ def is_key_managed(dotted_key: str) -> bool:
 def is_env_managed(name: str) -> bool:
     """True if the env var name is pinned by the managed .env layer."""
     return name in load_managed_env()
+
+
+def pinned_terminal_backend() -> Optional[str]:
+    """The ``terminal.backend`` the managed config pins, expanded, or None when it pins none.
+
+    Only a non-empty string is a pin: an empty or null ``backend:`` names no backend to run, so the
+    profile's own setting still decides.
+    """
+    terminal = apply_managed_overlay({}).get("terminal")
+    backend = terminal.get("backend") if isinstance(terminal, dict) else None
+    return (backend.strip() or None) if isinstance(backend, str) else None
