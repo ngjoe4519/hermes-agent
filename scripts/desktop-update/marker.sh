@@ -52,7 +52,7 @@ proc_ct() { # pid -> creation time (unix seconds, 3 decimals), or nothing
     # fall-back hour cannot shift the identity by 3600 s.
     lstart="$(TZ=UTC0 LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//;s/ *$//')"
     [ -n "$lstart" ] || return 0
-    secs="$(TZ=UTC0 LC_ALL=C date -j -f '%a %b %e %T %Y' "$lstart" +%s 2>/dev/null)" || return 0
+    secs="$(TZ=UTC0 LC_ALL=C /bin/date -j -f '%a %b %e %T %Y' "$lstart" +%s 2>/dev/null)" || return 0
     [ -n "$secs" ] && printf '%s.000\n' "$secs"
   fi
 }
