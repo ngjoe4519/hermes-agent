@@ -1824,6 +1824,10 @@ catalog: CatalogTranslations
         disabledTitle: string
         disabledMessage: string
         failedSave: string
+        browserLabel: string
+        browserDescription: string
+        browserSavedTitle: string
+        browserSavedMessage: string
         prompt: {
           title: string
           body: string
