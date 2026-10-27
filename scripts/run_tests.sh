@@ -53,6 +53,37 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/null; }
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
+
+# A test run under a faked HOME (worktree lanes, probe homes) provisions its
+# test environment from the OS account's tool store instead of downloading
+# ~1 GB of tools into every temporary home. The store holds immutable,
+# version-keyed entries written under its install lock, so concurrent runs
+# share it safely. Only this runner's own provisioning shares: the pytest
+# children below start from `env -i` without HERMES_RUNTIME_DIR, so tests that
+# exercise setup, install or update keep their own stores. An explicit
+# HERMES_RUNTIME_DIR, a custom HERMES_HOME, a home that already holds a store,
+# or an account without a usable store keep today's per-home layout.
+_account_tool_store() {
+  local account
+  [ -z "${HERMES_RUNTIME_DIR:-}" ] || return 1
+  case "${HERMES_HOME:-}" in "" | "$HOME/.hermes" | "$HOME/.hermes/"*) ;; *) return 1 ;; esac
+  [ ! -f "$HOME/.hermes/tools/facts.json" ] || return 1
+  account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  [ -n "$account" ] && [ -d "$account" ] || return 1
+  [ "$(cd "$account" && pwd -P)" != "$(cd "$HOME" 2>/dev/null && pwd -P)" ] || return 1
+  [ -f "$account/.hermes/tools/facts.json" ] && [ -w "$account/.hermes/tools" ] || return 1
+  printf '%s\n' "$account"
+}
+if _account="$(_account_tool_store)"; then
+  export HERMES_RUNTIME_DIR="$_account/.hermes/tools"
+  # setup-hermes.sh's uv-managed bootstrap interpreter is the same kind of cache.
+  if [ -z "${UV_PYTHON_INSTALL_DIR:-}" ] && [ -w "$_account/.local/share/uv/python" ]; then
+    export UV_PYTHON_INSTALL_DIR="$_account/.local/share/uv/python"
+  fi
+  echo "▶ faked HOME: using the account's tool store $HERMES_RUNTIME_DIR"
+fi
+unset _account
 if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
