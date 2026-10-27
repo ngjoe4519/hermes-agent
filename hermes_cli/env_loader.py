@@ -29,6 +29,7 @@ _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
 _WARNED_KEYS: set[str] = set()          # credential names already given the non-ASCII warning
 _WARNED_UTF32_PATHS: set[str] = set()   # .env paths already given the UTF-32 refuse-to-mangle warning
 _SCOPED_SKIP_LOGGED: set[str] = set()   # routed profile homes whose multiplex dotenv skip was logged
+_WARNED_UNREADABLE_PATHS: set[str] = set()  # withheld profile dotenv files already named in a warning
 
 # env-var name → source label ("bitwarden", …) for externally injected credentials; setup / `hermes
 # model` tell users WHERE a key came from when .env lacks it.
@@ -501,6 +502,44 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def dotenv_unreadable(path: Path) -> bool:
+    """True when *path* exists but this process may not read it: how a sandbox launcher withholds the
+    profile's credential files (the file still reports as present)."""
+    try:
+        with open(path, "rb"):
+            return False
+    except PermissionError:
+        return True
+    except OSError:  # missing, or a failure that is not a refusal: the caller's usual path applies
+        return False
+
+
+def _load_profile_dotenv(path: Path, *, override: bool, load_pass: int) -> bool:
+    """Load one of the profile's own dotenv files; False when it is withheld.
+
+    A sandbox launcher withholds the profile's credential files from the backend it runs, passes the
+    keys in as environment and pins ``terminal.backend`` through managed scope. Under that pin a present
+    but unreadable file loads like a missing one, with a warning. Without it the ``PermissionError``
+    propagates: the file may be the only place the terminal backend is set, and skipping it would run
+    terminal commands on the host.
+    """
+    try:
+        _load_dotenv_with_fallback(path, override=override, load_pass=load_pass)
+    except PermissionError:
+        from hermes_cli import managed_scope
+
+        if managed_scope.pinned_terminal_backend() is None:
+            raise
+        path_key = str(path.resolve())
+        with _DOTENV_LOCK:
+            first = path_key not in _WARNED_UNREADABLE_PATHS
+            _WARNED_UNREADABLE_PATHS.add(path_key)
+        if first:
+            logger.warning("%s is not readable; starting without the keys in it", path)
+        return False
+    return True
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -550,16 +589,16 @@ def load_hermes_dotenv(
 
     loaded: list[Path] = []
     user_env = home_path / ".env"
+    user_env_present = user_env.exists()  # a withheld file is present, unreadable
     project_env_path = Path(project_env) if project_env else None
     load_pass = next(_DOTENV_PASSES)  # one pass: later layers below see the earlier layers' output
 
-    if user_env.exists():  # normalize formatting / strip NULs before parsing
+    if user_env_present:  # normalize formatting / strip NULs before parsing
         _sanitize_env_file_if_needed(user_env)
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True, load_pass=load_pass)
+    if user_env_present and _load_profile_dotenv(user_env, override=True, load_pass=load_pass):
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
@@ -568,10 +607,12 @@ def load_hermes_dotenv(
     # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False, load_pass=load_pass)
+        _load_profile_dotenv(op_env, override=False, load_pass=load_pass)
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded, load_pass=load_pass)
+        # Only fills gaps while the profile has a .env, read or withheld: a withheld one means the keys
+        # arrived as environment, and the project file must not replace them.
+        _load_dotenv_with_fallback(project_env_path, override=not user_env_present, load_pass=load_pass)
         loaded.append(project_env_path)
 
     # The override=True loads above wrote the raw .env line (``__BITWARDEN_MANAGED__`` placeholder, stale

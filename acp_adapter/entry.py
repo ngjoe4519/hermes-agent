@@ -88,7 +88,7 @@ def _load_env() -> None:
     for env_file in loaded or ():
         log.info("Loaded env from %s", env_file)
     if not loaded:
-        log.info("No .env found at %s, using system env", hermes_home / ".env")
+        log.info("No .env loaded from %s, using system env", hermes_home / ".env")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

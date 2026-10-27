@@ -97,7 +97,7 @@ _loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=Pat
 for _env_path in _loaded_env_paths:
     logger.info("Loaded environment variables from %s", _env_path)
 if not _loaded_env_paths:
-    logger.info("No .env file found. Using system environment variables.")
+    logger.info("No .env file loaded. Using system environment variables.")
 
 
 from model_tools import get_toolset_for_tool
