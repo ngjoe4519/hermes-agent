@@ -14,10 +14,12 @@ import {
   setSelectedStoredSessionId,
   setSessions
 } from './session'
+import { sessionOwnerRowKey } from './session-request-router'
 import { clearAllSessionStates } from './session-states'
 import {
   $sessionSeenCounts,
   $unreadFinishedMarkers,
+  ackStoredSessionId,
   forgetSessionUnread,
   markSessionUnreadFinished
 } from './session-unread'
@@ -164,7 +166,9 @@ describe('persisted unread (session-unread)', () => {
     ])
 
     // Only alpha's row is past its watermark; beta's sits exactly on it.
-    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+    expect($unreadFinishedSessionIds.get()).toEqual([
+      sessionOwnerRowKey(session({ id: 's1', message_count: 5, profile: 'alpha' }))
+    ])
     expect($sessionSeenCounts.get()).toEqual({ alpha: { s1: 3 }, beta: { s1: 5 } })
 
     // Opening beta's row (the gateway is on beta) acks beta only.
@@ -183,6 +187,27 @@ describe('persisted unread (session-unread)', () => {
 
     expect($sessionSeenCounts.get()).toEqual({ alpha: { s1: 3 }, beta: { s1: 6 } })
     expect($unreadFinishedMarkers.get()).toEqual({ alpha: ['s1'] })
+  })
+
+  it('migrates same-profile same-id unread state per connection and acks only the clicked owner', () => {
+    const alpha = session({ connection_id: 'gateway-a', id: 's1', message_count: 5, profile: 'default' })
+    const beta = session({ connection_id: 'gateway-b', id: 's1', message_count: 5, profile: 'default' })
+    const alphaKey = sessionOwnerRowKey(alpha)
+    const betaKey = sessionOwnerRowKey(beta)
+
+    $sessionSeenCounts.set({ default: { s1: 3 } })
+    $unreadFinishedMarkers.set({ default: ['s1'] })
+    setSessions([alpha, beta])
+
+    expect($sessionSeenCounts.get().default).toMatchObject({ [alphaKey]: 3, [betaKey]: 3 })
+    expect($unreadFinishedMarkers.get()).toEqual({ default: [alphaKey, betaKey] })
+
+    ackStoredSessionId(beta)
+    setSelectedStoredSessionId('s1')
+
+    expect($sessionSeenCounts.get().default).toMatchObject({ [alphaKey]: 3, [betaKey]: 5 })
+    expect($unreadFinishedMarkers.get()).toEqual({ default: [alphaKey] })
+    expect($unreadFinishedSessionIds.get()).toEqual([alphaKey])
   })
 
   it('files a live-edge marker with no loaded row under the active gateway profile', () => {
