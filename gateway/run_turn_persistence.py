@@ -26,6 +26,7 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
+from gateway.session_detached import detached_route_of
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
 from gateway.warning_notifications import diagnostic_wake_muted
@@ -340,11 +341,14 @@ class GatewayTurnPersistenceMixin:
                 "session intact; the next message retries normally.",
                 session_entry.session_id if session_entry else "?",
             )
-        elif agent_result.get("compression_exhausted") and getattr(source, "platform", None) == Platform.API_SERVER:
+        elif agent_result.get("compression_exhausted") and (
+                getattr(source, "platform", None) == Platform.API_SERVER or detached_route_of(source)):
             # The caller addresses an API conversation by its id and every API door re-validates that
             # binding (``restore_api_session``): a rotated entry would refuse each later request to it
-            # (``admission_conflict``). The caller gets the typed ``compression_exhausted`` result instead.
-            logger.info("Keeping API session %s after compression exhaustion.",
+            # (``admission_conflict``). A conversation its chat moved past has no route of its own to
+            # reset (gateway/session_detached.py). Either caller gets the typed ``compression_exhausted``
+            # result instead, never a reset that did not happen.
+            logger.info("Keeping session %s after compression exhaustion.",
                         session_entry.session_id if session_entry else "?")
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):

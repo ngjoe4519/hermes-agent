@@ -4,7 +4,7 @@ Pre-authority cron runs, subagent transcripts, API rows without a binding, and r
 WebUI or the foreign-session importer wrote: before #106742 a viewer opened any of them straight
 from ``state.db``. Nothing can run them (no frozen policy, no lane, and adopting a WebUI row as
 writable would legitimise its second writer), so the owner mounts them for reading only. The mount
-is ``superseded``, so nothing route-keyed acts through it, and every capability but
+is keyed by no lane's route, so nothing route-keyed acts through it, and every capability but
 ``session:read`` is refused by name. Archive, pin and delete still work as for any read-only mount
 (gateway/session_mutations.py), but only a leaf row deletes. Old local CLI/TUI/Desktop rows are not mounted
 here: resume adopts them as writable conversations (gateway/session_local_migration.py).
@@ -43,7 +43,7 @@ def mount_history(authority, actor, sid):
             return False  # restore_api_session's
     authority._require_admission_open()
     from gateway.session_authority import LiveSession
-    authority.sessions.setdefault(sid, LiveSession(None, _ROUTE_PREFIX + sid, superseded=True, history_mount=True))
+    authority.sessions.setdefault(sid, LiveSession(None, _ROUTE_PREFIX + sid))
     return True
 
 
