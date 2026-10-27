@@ -3977,6 +3977,7 @@ catalog: CatalogTranslations
       goForward: string
       sendEdited: string
       attachingFile: string
+      quoteInChat: string
     }
     approval: {
       gatewayDisconnected: string
