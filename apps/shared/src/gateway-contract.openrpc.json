@@ -8599,6 +8599,11 @@
             "title": "Verbose",
             "type": "boolean"
           },
+          "pin_route": {
+            "default": false,
+            "title": "Pin Route",
+            "type": "boolean"
+          },
           "client_env": {
             "anyOf": [
               {
