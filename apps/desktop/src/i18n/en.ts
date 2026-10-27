@@ -3265,7 +3265,9 @@ export const en: Translations = {
     },
     statusDivider: {
       working: 'Working',
-      done: 'Done'
+      blocked: 'Blocked',
+      ready: 'Ready',
+      inactive: 'Inactive'
     },
     markAllRead: 'Mark all as read'
   },
