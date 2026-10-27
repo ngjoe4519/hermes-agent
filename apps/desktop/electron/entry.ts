@@ -6,8 +6,13 @@ import { app } from 'electron'
 
 import { resolveDesktopHermesHome } from './data-paths'
 import { readDesktopLaunchConfig } from './renderer-heap-flags'
+import { restoreUserProxyEnv } from './updater/system-proxy-env'
 import { wslgLaunchArgs } from './wslg-launch'
 import { spawnWslgLaunch } from './wslg-launch-process'
+
+// A Desktop relaunched by an update (any rung: hand-off script, staged updater,
+// Start-Process) must not keep the system proxy the update's children were given.
+restoreUserProxyEnv(process.env)
 
 function configuredElectronFlags(env: NodeJS.ProcessEnv): string[] {
   // Resolve the home exactly like main.ts does, through the shared resolver:

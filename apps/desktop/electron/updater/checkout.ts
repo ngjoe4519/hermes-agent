@@ -339,7 +339,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     const child = spawnUpdaterProcess(updater, updaterArgs, {
       cwd: deps.hermesHome,
       env: {
-        ...sourceUpdateEnvironment(updateRoot, deps.hermesHome)
+        ...(await sourceUpdateEnvironment(updateRoot, deps.hermesHome, deps.rememberLog))
       },
       detached: true,
       stdio: 'ignore'
@@ -588,7 +588,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
       child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
         cwd: deps.hermesHome,
         env: {
-          ...sourceUpdateEnvironment(updateRoot, deps.hermesHome),
+          ...(await sourceUpdateEnvironment(updateRoot, deps.hermesHome, deps.rememberLog)),
           HERMES_UPDATE_STARTED_AT: String(updateStartedAt)
         },
         // Never `true` here: DETACHED_PROCESS leaves the wrapper console-less, so
@@ -727,7 +727,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     const child = spawnUpdaterProcess(handoff.command, args, {
       cwd: deps.hermesHome,
       env: {
-        ...sourceUpdateEnvironment(updateRoot, deps.hermesHome),
+        ...(await sourceUpdateEnvironment(updateRoot, deps.hermesHome, deps.rememberLog)),
         HERMES_UPDATE_STARTED_AT: String(updateStartedAt)
       },
       detached: true,
