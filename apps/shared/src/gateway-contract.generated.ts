@@ -2927,6 +2927,7 @@ export interface PendingApproval {
   allow_permanent?: boolean | null
   allow_session?: boolean | null
   smart_denied?: boolean | null
+  smart_unavailable?: string | null
   choices?: string[] | null
   tool_name?: string | null
   [key: string]: unknown
@@ -5414,6 +5415,7 @@ export interface ApprovalRequestParams {
   allow_permanent?: boolean | null
   allow_session?: boolean | null
   smart_denied?: boolean | null
+  smart_unavailable?: string | null
   tool_name?: string | null
   gateway_session_id?: string | null
   [key: string]: unknown
